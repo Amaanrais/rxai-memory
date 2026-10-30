@@ -5,11 +5,14 @@
 Citations, first that gives any session id:
   1. the [E#] labels on the agent's FINAL ANSWER line;
   2. the [E#] labels in the last paragraph of its reasoning (the reply before the FINAL ANSWER line);
-  3. suggest_citations(), as run.py logged it.
-Labels map to session ids through the excerpts run.py sent (<results>.evidence.jsonl): E1 is the first excerpt.
-A question abstains when the agent said INSUFFICIENT_EVIDENCE or its status isn't "answered"; it keeps the
-suggested citations, since evidence F1 counts on every answerable question, abstained or not. Questions with no
-result line abstain too. When a question has several result lines, an answered one wins, then the latest.
+  3. support: the excerpts we sent whose text contains the agent's answer (normalized as score.py does), else
+     those holding at least SUPPORT_SHARE of the answer's content words; else nothing. A match in more than
+     MAX_MATCHED of the excerpts singles none out (a bare "2"), so it cites nothing either. Never the
+     top-ranked session by default: the organisers' rule is that fallback citations must support the answer.
+Labels and excerpts map to session ids through what run.py sent (<results>.evidence.jsonl): E1 is the first
+excerpt. A question abstains, with no citations, when the agent said INSUFFICIENT_EVIDENCE or its status isn't
+"answered", or when it has no result line. When a question has several result lines, an answered one wins, then
+the latest.
 """
 from __future__ import annotations
 
@@ -20,7 +23,8 @@ from collections import Counter
 from pathlib import Path
 
 from eval_retrieval import read_jsonl
-from score import validate, write_jsonl
+from retrieval import STOPWORDS, TIME_CUE_LABEL
+from score import normalize, validate, write_jsonl
 
 # the client's final-answer marker (reactor/client.py, _FINAL)
 FINAL = re.compile(r"^[ \t]*#{1,3}[ \t]*final[ _-]?answer[ \t]*\[[ \t]*ref[ \t]*:[ \t]*[0-9a-f]{8}[ \t]*\]",
@@ -28,6 +32,11 @@ FINAL = re.compile(r"^[ \t]*#{1,3}[ \t]*final[ _-]?answer[ \t]*\[[ \t]*ref[ \t]*
 GROUP = re.compile(r"\[([^\[\]]*)\]")
 LABEL = re.compile(r"\bE(\d+)\b")
 LABELS = re.compile(r"\s*\[[^\[\]]*\bE\d+\b[^\[\]]*\]")
+# lines retrieval.evidence() adds to an excerpt, not words from the history
+NOTE = re.compile(r"^(?:\(\d+ days? before the question date\)|\[most recent\])$", re.MULTILINE)
+SUPPORT_SHARE = 0.6
+# a match in more than this share of the excerpts doesn't single any out ("2" is in all of them): no support
+MAX_MATCHED = 0.5
 
 
 def labels(text: str) -> list[int]:
@@ -49,22 +58,49 @@ def last_paragraph(reply: str) -> str:
     return paragraphs[-1] if paragraphs else ""
 
 
+def excerpt_words(text: str) -> str:
+    """An excerpt's history text, normalized as score.py does, padded for whole-phrase matching."""
+    text = NOTE.sub("", text).replace(TIME_CUE_LABEL, "")
+    return f" {normalize(text)} "
+
+
+def supported(answer: str, evidence: list[dict]) -> tuple[list[str], str]:
+    """(session ids of the excerpts that support ``answer``, how): those containing the whole normalized answer
+    ("exact"), else those holding at least SUPPORT_SHARE of its content words ("partial"), else none. Matches
+    in more than MAX_MATCHED of the excerpts don't single any out and count as none."""
+    phrase = normalize(answer)
+    if not phrase:
+        return [], "unsupported"
+    texts = [(e["id"], excerpt_words(e["text"])) for e in evidence if e.get("id")]
+    singles_out = lambda matched: 0 < len(matched) <= MAX_MATCHED * len(texts)
+    exact = [sid for sid, text in texts if f" {phrase} " in text]
+    if exact:
+        return (list(dict.fromkeys(exact)), "exact") if singles_out(exact) else ([], "unspecific")
+    words = {w for w in phrase.split() if w not in STOPWORDS}
+    if words:
+        partial = [sid for sid, text in texts
+                   if len(words & set(text.split())) >= SUPPORT_SHARE * len(words)]
+        if partial:
+            return (list(dict.fromkeys(partial)), "partial") if singles_out(partial) else ([], "unspecific")
+    return [], "unsupported"
+
+
 def predict(question_id: str, result: dict | None, logged: dict | None) -> tuple[dict, str]:
     """(prediction, where its citations came from)."""
     evidence = (logged or {}).get("evidence", [])
-    suggested = (logged or {}).get("suggested", [])
     if not result or result.get("status") != "answered" or result.get("abstained"):
-        return {"question_id": question_id, "abstain": True, "answer": "", "citations": suggested}, "abstain"
+        return {"question_id": question_id, "abstain": True, "answer": "", "citations": []}, "abstain"
     answer = result.get("answer", "")
-    for source, text in (("answer", answer), ("reasoning", last_paragraph(result.get("reply", "")))):
+    clean = LABELS.sub("", answer).strip()
+    for source, text in (("answer labels", answer), ("reasoning labels", last_paragraph(result.get("reply", "")))):
         cited = to_ids(labels(text), evidence)
-        if not cited and source == "answer" and not evidence:  # no log entry: the client's own mapping
+        if not cited and source == "answer labels" and not evidence:  # no log entry: the client's own mapping
             cited = list(dict.fromkeys(c["id"] for c in result.get("citations", []) if c.get("id")))
         if cited:
             break
     else:
-        source, cited = "suggested", suggested
-    clean = LABELS.sub("", answer).strip()
+        cited, how = supported(clean, evidence)
+        source = f"support ({how})"
     return {"question_id": question_id, "abstain": False, "answer": clean, "citations": cited}, source
 
 

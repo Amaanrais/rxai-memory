@@ -27,7 +27,7 @@ python predictions.py examples/results-example.jsonl --histories examples/histor
     --out predictions-example.jsonl --abstain-on agent,no-answer
 #   -> 3 prediction(s) (2 abstained) written to predictions-example.jsonl; 0 result(s) skipped
 
-export REACTOR_ACCESS_KEY=rxk_...                   # from your private message
+printf 'Access key: '; read -rs REACTOR_ACCESS_KEY; echo; export REACTOR_ACCESS_KEY   # paste the key from your private message; it isn't shown
 B="--base-url https://tNN.api.reactor-hackathon.rxai.dev --agent-id agt_..."
 python client.py $B --new-history                   # -> {"status": "history", "history_id": "9f2c...", ...}
 python client.py $B --history 9f2c... --question "When is the wedding?" \
@@ -46,7 +46,7 @@ python -m venv .venv
 .venv\Scripts\python.exe client.py --help           # works offline
 .venv\Scripts\python.exe predictions.py examples\results-example.jsonl --histories examples\histories-example.jsonl --out predictions-example.jsonl --abstain-on agent,no-answer
 
-$env:REACTOR_ACCESS_KEY = "rxk_..."                 # from your private message; this window only
+$env:REACTOR_ACCESS_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "Access key" -AsSecureString)).Password   # paste the key; this window only
 $B = @("--base-url", "https://tNN.api.reactor-hackathon.rxai.dev", "--agent-id", "agt_...")
 .venv\Scripts\python.exe client.py @B --new-history
 .venv\Scripts\python.exe client.py @B --history 9f2c... --question "When is the wedding?" --question-date "2023/05/30 (Tue) 08:08" --evidence examples\excerpts-example.json --question-id q_example0001 >> results.jsonl
@@ -68,8 +68,11 @@ Never start a new history between questions of the same dataset history. Evidenc
 `session_id` as `"id"` and its session `"date"`, assistant turns included (`PARTICIPANTS.md`, section 3). You may
 also load a whole dataset history into its Reactor history before asking: allowed, and described there too.
 
-`examples/run_benchmark.py` does exactly this, appending each answer to `results.jsonl` as it goes (run it again
-after an interruption: answered questions are skipped). Its `retrieve()` is a naive keyword baseline: **replace it
+`examples/run_benchmark.py` does exactly this, appending each answer to `results.jsonl` as it goes. Run it again
+after an interruption: questions already in `results.jsonl` are skipped (delete a line to ask that question again).
+**A rerun starts a new Reactor history** for each dataset history with questions left, so the agent no longer has
+what it saw for that history's earlier questions. That's harmless here, since every question carries its own
+evidence; if you load whole histories, load the history again before asking the rest. Its `retrieve()` is a naive keyword baseline: **replace it
 with your retrieval.**
 
 ```sh

@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from datetime import date, datetime
 
 WINDOW = 1500
 NEIGHBOUR_CHARS = 600
@@ -114,9 +115,30 @@ class HistoryIndex:
         scored = self._session_scores(self.rank_chunks(question))[:k_sessions]
         return [(self.sessions[si]["session_id"], score) for si, score in scored]
 
-    def evidence(self, question: str, budget: int = 12000, k_sessions: int = 5,
-                 per_session_hits: int = 2) -> list[dict]:
-        """Excerpts of the top sessions, chronological: each session's best turns with one turn either side."""
+    def suggest_citations(self, question: str, ratio: float = 0.6, multi_k: int = 2, max_k: int = 5) -> list[str]:
+        """Session ids to cite: the top one, plus each next one scoring >= ``ratio`` x the top.
+
+        An aggregate question (``is_aggregate()``) cites at least ``multi_k``."""
+        ranked = self.search(question, k_sessions=max_k)
+        if not ranked:
+            return []
+        n = 1
+        while n < len(ranked) and ranked[n][1] >= ratio * ranked[0][1]:
+            n += 1
+        if is_aggregate(question):
+            n = max(n, min(multi_k, len(ranked)))
+        return [sid for sid, _ in ranked[:n]]
+
+    def evidence(self, question: str, budget: int | None = None, k_sessions: int | None = None,
+                 per_session_hits: int = 2, question_date: str | None = None) -> list[dict]:
+        """Excerpts of the top sessions, chronological: each session's best turns with one turn either side.
+
+        ``budget`` and ``k_sessions`` default to the question's route (``route()``). With ``question_date``,
+        each excerpt starts with how many days before it its session took place. The latest excerpt is
+        marked ``[most recent]``: for a value that changed, the latest mention wins."""
+        route_k, route_budget = route(question)
+        budget = route_budget if budget is None else budget
+        k_sessions = route_k if k_sessions is None else k_sessions
         ranked = self.rank_chunks(question)
         top = self._session_scores(ranked)[:k_sessions]
         if not top:
@@ -132,9 +154,19 @@ class HistoryIndex:
             elif len(turns) < per_session_hits:
                 turns[ti] = [ci]
         excerpts = []
-        for si, _ in sorted(top):  # session order is chronological
-            excerpts.append({"id": self.sessions[si]["session_id"], "date": self.sessions[si]["date"],
-                             "text": self._excerpt(si, hits[si], share)})
+        chronological = sorted(top)  # session order is chronological
+        for si, _ in chronological:
+            session = self.sessions[si]
+            notes = []
+            if question_date:
+                days = days_before(session["date"], question_date)
+                notes.append(f"({days} day{'' if days == 1 else 's'} before the question date)")
+            if si == chronological[-1][0]:
+                notes.append("[most recent]")
+            header = "\n".join(notes)
+            text = self._excerpt(si, hits[si], share - len(header) - 1)
+            excerpts.append({"id": session["session_id"], "date": session["date"],
+                             "text": f"{header}\n{text}" if header else text})
         return excerpts
 
     def _excerpt(self, si: int, hit_turns: dict[int, list[int]], share: int) -> str:
@@ -171,10 +203,34 @@ class HistoryIndex:
         return f"{turn['role']}: {body}"
 
 
+AGGREGATE = re.compile(r"\b(how many|total|all|both|combined|before|after|first|last|between|how long|ago)\b"
+                       r"|\bwhich\b.*\bfirst\b")
+
+
+def is_aggregate(question: str) -> bool:
+    """A question that counts, totals, compares or orders: its answer usually spans several sessions."""
+    return bool(AGGREGATE.search(question.lower()))
+
+
+def route(question: str) -> tuple[int, int]:
+    """(k_sessions, budget): 8 sessions in 24,000 characters for aggregate questions, else 5 in 12,000."""
+    return (8, 24000) if is_aggregate(question) else (5, 12000)
+
+
+def parse_date(value: str) -> date:
+    """The calendar day of a dataset date, "2023/05/20 (Sat) 02:21"."""
+    return datetime.strptime(value[:10], "%Y/%m/%d").date()
+
+
+def days_before(session_date: str, question_date: str) -> int:
+    return (parse_date(question_date) - parse_date(session_date)).days
+
+
 def clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 3, 0)] + "..."
 
 
-def retrieve(question: dict, history: dict, k: int = 5) -> list[dict]:
-    """Drop-in for run_benchmark.py's ``retrieve()``: evidence from the ``k`` best sessions."""
-    return HistoryIndex(history).evidence(question["question"], k_sessions=k)
+def retrieve(question: dict, history: dict, k: int | None = None) -> list[dict]:
+    """Drop-in for run_benchmark.py's ``retrieve()``: evidence from the ``k`` best sessions (default: routed)."""
+    return HistoryIndex(history).evidence(question["question"], k_sessions=k,
+                                          question_date=question.get("question_date"))

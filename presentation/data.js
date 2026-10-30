@@ -4,7 +4,7 @@ const DECK = {
   title: "Finding the needle",
   subtitle: "Memory retrieval for Reactor: BM25, focused evidence, answer-backed citations",
   event: "RxAI Memory Retrieval Challenge · October 2026",
-  team: ["Amaan Rais (captain)", "Dedar Alam", "Frensi Qatipi"],
+  team: ["Amaan Rais", "Dedar Alam", "Frensi Qatipi"],
   repo: "rxai-memory",
 
   problem: {

@@ -7,7 +7,8 @@
 <style>
   :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --dim:#8b949e; --accent:#f2a33a; --accent2:#4fb6c9; }
   * { box-sizing:border-box; margin:0; }
-  html, body { height:100%; background:var(--bg); color:var(--text); font:18px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  html { background:var(--bg); }
+  html, body { height:100%; color:var(--text); font:18px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
   #deck { height:100vh; overflow-y:auto; scroll-snap-type:y mandatory; scrollbar-width:none; }
   section { height:100vh; scroll-snap-align:start; display:flex; flex-direction:column; justify-content:center;
             padding:6vh 8vw; gap:3vh; }
@@ -31,10 +32,18 @@
   svg text { fill:var(--text); font-family:inherit; }
   #nav { position:fixed; right:1.2rem; bottom:1rem; color:var(--dim); font-size:.85rem; }
   #bar { position:fixed; left:0; top:0; height:3px; background:var(--accent); transition:width .2s; }
-  @media print { #deck { height:auto; overflow:visible; } section { page-break-after:always; } #nav, #bar { display:none; } }
+  #gl { position:fixed; inset:0; width:100%; height:100%; z-index:-1; }
+  .card { background:rgba(22,27,34,.82); backdrop-filter:blur(6px); }
+  /* slide content rises in when its slide arrives (transform/opacity only: GPU-composited) */
+  section > * { opacity:0; transform:translateY(28px); transition:opacity .7s ease, transform .7s cubic-bezier(.2,.7,.2,1); }
+  section.in > * { opacity:1; transform:none; }
+  section.in > :nth-child(2) { transition-delay:.12s; } section.in > :nth-child(3) { transition-delay:.24s; }
+  @media (prefers-reduced-motion:reduce) { section > * { transition:none; opacity:1; transform:none; } }
+  @media print { #deck { height:auto; overflow:visible; } section { page-break-after:always; } section > * { opacity:1; transform:none; } #nav, #bar, #gl { display:none; } }
 </style>
 </head>
 <body>
+<canvas id="gl"></canvas>
 <div id="bar"></div>
 <main id="deck"></main>
 <div id="nav"></div>
@@ -122,6 +131,60 @@ addEventListener("keydown", e => {
   if (e.key === "End") go(sections.length - 1);
 });
 status();
+const reveal = new IntersectionObserver(es => es.forEach(e => e.target.classList.toggle("in", e.isIntersecting)), { threshold: .5 });
+sections.forEach(s => reveal.observe(s));
+
+// WebGL background, rendered on the GPU: a drifting "haystack" of faint points, one gold "needle" that brightens
+// as the deck advances. No WebGL, or reduced motion: the plain dark background stays.
+(() => {
+  const canvas = document.getElementById("gl"), gl = canvas.getContext("webgl");
+  if (!gl) return;
+  const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const frag = `precision mediump float;
+    uniform vec2 res; uniform float t, progress;
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    void main() {
+      vec2 uv = gl_FragCoord.xy / res.y, c = vec2(res.x / res.y, 1.0);
+      vec3 col = vec3(0.051, 0.067, 0.09);
+      col += 0.05 * vec3(0.31, 0.71, 0.79) * smoothstep(1.4, 0.0, length(uv - vec2(0.15 * c.x, 0.9)));
+      col += 0.05 * vec3(0.95, 0.64, 0.23) * smoothstep(1.4, 0.0, length(uv - vec2(0.9 * c.x, 0.1)));
+      for (int layer = 0; layer < 3; layer++) {               // the haystack: three parallax layers of points
+        float s = 18.0 + float(layer) * 14.0;
+        vec2 p = uv * s + vec2(t * (0.02 + 0.015 * float(layer)), t * 0.01);
+        vec2 id = floor(p), f = fract(p) - 0.5;
+        vec2 o = vec2(hash(id), hash(id + 7.3)) - 0.5;
+        float d = length(f - o * 0.7);
+        float tw = 0.5 + 0.5 * sin(t * 1.5 + hash(id + 3.1) * 6.28);
+        col += vec3(0.31, 0.71, 0.79) * smoothstep(0.06, 0.0, d) * 0.22 * tw / (1.0 + float(layer));
+      }
+      vec2 needle = vec2(c.x * (0.82 - 0.1 * progress), 0.72 + 0.03 * sin(t * 0.7));  // the needle
+      float n = length(uv - needle);
+      col += vec3(0.95, 0.64, 0.23) * (0.004 / (n * n + 0.002)) * (0.35 + 0.65 * progress) * 0.3;
+      gl_FragColor = vec4(col, 1.0);
+    }`;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }"));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, frag));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const u = name => gl.getUniformLocation(prog, name);
+  let shown = 0;
+  const frame = ms => {
+    const dpr = Math.min(devicePixelRatio, 1.5), w = innerWidth * dpr | 0, h = innerHeight * dpr | 0;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
+    shown += (current() / (sections.length - 1) - shown) * 0.05;  // ease toward the current slide
+    gl.uniform2f(u("res"), w, h); gl.uniform1f(u("t"), ms / 1000); gl.uniform1f(u("progress"), shown);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (!still) requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+})();
 </script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 """Offline retrieval metrics for retrieval.py on a dev split: no Reactor calls.
 
-    python eval_retrieval.py dev [--k 1 3 5 10] [--cite 2] [--limit N] [--misses FILE] [--version 2]
+    python eval_retrieval.py dev [--k 1 3 5 10] [--cite 2] [--limit N] [--misses FILE] [--version 2] [--json FILE]
 
 For answerable questions, per question_type and overall:
   hit@k    any gold session in the top k sessions
@@ -73,6 +73,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, help="an evenly spread sample of N questions")
     ap.add_argument("--misses", type=Path, help="write answerable questions with no gold session in the top 5")
     ap.add_argument("--version", type=int, default=1, choices=(1, 2), help="evidence() version")
+    ap.add_argument("--json", type=Path, help="also write the table as JSON (app.py's Results tab reads it)")
     args = ap.parse_args()
 
     questions = read_jsonl(args.split / "questions.jsonl")
@@ -140,6 +141,16 @@ def main() -> int:
         print(f"missing-words hint   {label:<13} {int(sum(hinted[abstain]))}/{n}"
               + (f" = {sum(hinted[abstain]) / n:.3f}" if n else ""))
     print(f"\n{done} histories in {time.time() - started:.0f}s")
+
+    if args.json:
+        table = {key: {"n": len(rows[key]["sent"]), **{n: sum(rows[key][n]) / len(rows[key][n]) for n in names}}
+                 for key in order}
+        hints = {label: {"fired": int(sum(hinted[abstain])), "n": len(hinted[abstain])}
+                 for abstain, label in ((False, "answerable"), (True, "unanswerable"))}
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps({"split": args.split.name, "version": args.version, "limit": args.limit,
+                                         "rows": table, "hint": hints}, indent=1), encoding="utf-8")
+        print(f"table written to {args.json}")
 
     if args.misses:
         with args.misses.open("w", encoding="utf-8") as f:

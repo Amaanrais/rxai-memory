@@ -12,7 +12,8 @@ Citations, first that gives any session id:
 Labels and excerpts map to session ids through what run.py sent (<results>.evidence.jsonl): E1 is the first
 excerpt. A question abstains, with no citations, when the agent said INSUFFICIENT_EVIDENCE or its status isn't
 "answered", or when it has no result line. When a question has several result lines, an answered one wins, then
-the latest.
+the latest. A timed-out question whose answer arrived later, in another line's late_replies (Reactor's own answer
+to its ref), counts as answered with that answer (``recover_late()``; run.py also records such lines).
 """
 from __future__ import annotations
 
@@ -35,6 +36,8 @@ LABELS = re.compile(r"\s*\[[^\[\]]*\bE\d+\b[^\[\]]*\]")
 # lines retrieval.evidence() adds to an excerpt, not words from the history
 NOTE = re.compile(r"^(?:\(\d+ days? before the question date\)|\[most recent\])$", re.MULTILINE)
 SUPPORT_SHARE = 0.6
+# the client's abstention: INSUFFICIENT_EVIDENCE as the whole answer or its first word (reactor/client.py)
+INSUFFICIENT = re.compile(r"^\W*INSUFFICIENT_EVIDENCE\b", re.IGNORECASE)
 # a match in more than this share of the excerpts doesn't single any out ("2" is in all of them): no support
 MAX_MATCHED = 0.5
 
@@ -56,6 +59,33 @@ def last_paragraph(reply: str) -> str:
     reasoning = reply[:mark.start()] if mark else reply
     paragraphs = [p for p in re.split(r"\n\s*\n", reasoning) if p.strip()]
     return paragraphs[-1] if paragraphs else ""
+
+
+def recovered(timed_out: dict, late: dict, received_in: dict) -> dict:
+    """An answered result line for a timed-out question, from Reactor's own final answer to its ref that arrived
+    late, in ``received_in``'s ``late_replies``."""
+    return {"status": "answered", "question_id": timed_out["question_id"], "history_id": timed_out.get("history_id"),
+            "ref": late["ref"], "question": timed_out.get("question"), "question_date": timed_out.get("question_date"),
+            "answer": late.get("answer", ""), "reply": "", "citations": [],
+            "abstained": bool(INSUFFICIENT.match(late.get("answer", ""))),
+            "recovered": {"from_question_id": received_in.get("question_id"), "cycle": late.get("cycle")}}
+
+
+def recover_late(lines: list[dict]) -> list[dict]:
+    """Recovered lines (``recovered()``) for timed-out questions with no answered line whose answer arrived in a
+    later line's ``late_replies``, matched by the timed-out request's ref."""
+    answered = {r.get("question_id") for r in lines if r.get("status") == "answered"}
+    timed_out: dict[str, dict] = {}  # ref -> the timed-out line, from earlier lines only
+    out = []
+    for r in lines:
+        for late in r.get("late_replies") or []:
+            line = timed_out.get(late.get("ref"))
+            if line and line["question_id"] not in answered:
+                out.append(recovered(line, late, r))
+                answered.add(line["question_id"])
+        if r.get("status") == "timeout" and r.get("ref") and r.get("question_id"):
+            timed_out[r["ref"]] = r
+    return out
 
 
 def excerpt_words(text: str) -> str:
@@ -114,8 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     log_path = args.evidence_log or args.results.with_suffix(".evidence.jsonl")
 
     question_ids = [q["question_id"] for q in read_jsonl(args.questions)]
+    lines = read_jsonl(args.results)
     results: dict[str, dict] = {}
-    for r in read_jsonl(args.results):
+    for r in lines + recover_late(lines):
         qid = r.get("question_id")
         if qid and (r.get("status") == "answered" or results.get(qid, {}).get("status") != "answered"):
             results[qid] = r
@@ -128,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     for qid in question_ids:
         prediction, source = predict(qid, results.get(qid), logged.get(qid))
         predictions.append(prediction)
+        if qid in results and results[qid].get("recovered"):
+            source = f"late reply, {source}"
         sources["no result" if qid not in results else source] += 1
     errors = validate(predictions, set(question_ids))
     if errors:

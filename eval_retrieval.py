@@ -7,6 +7,7 @@ For answerable questions, per question_type and overall:
   all@k    every gold session in the top k
   sent     share of gold sessions among the excerpts evidence() would send
   F1@cite  evidence F1 if the top --cite sessions were cited
+  F1@sugg  evidence F1 of HistoryIndex.suggest_citations()
 Then the top-1 session score, answerable vs unanswerable: a first look at an abstention threshold.
 """
 from __future__ import annotations
@@ -94,13 +95,14 @@ def main() -> int:
                 continue
             ids = [sid for sid, _ in ranked]
             ev = set(g["evidence"])
-            sent = {e["id"] for e in index.evidence(q["question"])}
+            sent = {e["id"] for e in index.evidence(q["question"], question_date=q["question_date"])}
             m = {}
             for k in args.k:
                 m[f"hit@{k}"] = float(bool(ev & set(ids[:k])))
                 m[f"all@{k}"] = float(ev <= set(ids[:k]))
             m["sent"] = len(ev & sent) / len(ev)
             m[f"F1@{args.cite}"] = f1(ids[:args.cite], ev)
+            m["F1@sugg"] = f1(index.suggest_citations(q["question"]), ev)
             for key in (g["question_type"], "all"):
                 for name, value in m.items():
                     rows[key][name].append(value)
@@ -113,7 +115,7 @@ def main() -> int:
     if by_history:
         print(f"warning: {len(by_history)} histories not found in histories.jsonl", file=sys.stderr)
 
-    names = [f"{p}@{k}" for p in ("hit", "all") for k in args.k] + ["sent", f"F1@{args.cite}"]
+    names = [f"{p}@{k}" for p in ("hit", "all") for k in args.k] + ["sent", f"F1@{args.cite}", "F1@sugg"]
     order = sorted(k for k in rows if k != "all") + ["all"]
     width = max(len(k) for k in order)
     print(f"\n{'type':<{width}}  {'n':>4}  " + "  ".join(f"{n:>7}" for n in names))

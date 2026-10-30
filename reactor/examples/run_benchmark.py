@@ -7,7 +7,9 @@
 REACTOR_ACCESS_KEY must be set (QUICKSTART.md). Questions are grouped by their dataset ``history_id``: for each
 group, one ``--new-history``, then each of its questions in that Reactor history, one at a time. Each client line
 is appended to ``--out`` as UTF-8 at once, so an interrupted run loses nothing; run it again and the questions
-already in ``--out`` are skipped (delete their lines to ask again).
+already in ``--out`` are skipped (delete their lines to ask again). A rerun starts a new Reactor history for each
+dataset history with questions left: the agent no longer has what it saw for that history's earlier questions.
+Harmless here, as every question carries its own evidence; if you load whole histories, load again first.
 
 ``retrieve()`` below is a deliberately naive keyword baseline so that the pipeline runs end to end. **Replace it
 with your retrieval.** It returns excerpts in the client's evidence format: ``id`` = the session_id (the

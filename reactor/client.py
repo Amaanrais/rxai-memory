@@ -4,7 +4,8 @@ history; every run prints one JSON line.
 Needs Python 3.11+ and ``pip install "websockets>=14"`` -- nothing else. Your access key comes from the environment,
 never the command line (it would end up in your shell history):
 
-    export REACTOR_ACCESS_KEY=rxk_...                  # Windows PowerShell: $env:REACTOR_ACCESS_KEY = "rxk_..."
+    printf 'Access key: '; read -rs REACTOR_ACCESS_KEY; echo; export REACTOR_ACCESS_KEY   # typed or pasted, not shown
+    # Windows PowerShell: $env:REACTOR_ACCESS_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "Access key" -AsSecureString)).Password
     python client.py --base-url https://HOST --agent-id agt_... --new-history
         -> {"status": "history", "history_id": "9f2c...", ...}
     python client.py --base-url https://HOST --agent-id agt_... --history 9f2c... \\

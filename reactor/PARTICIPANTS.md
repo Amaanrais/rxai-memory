@@ -27,11 +27,16 @@ pip install "websockets>=14"
 
 ## 2. Set your key
 
-Put it in the environment, never on the command line:
+Type or paste it at a hidden prompt: it goes into the environment of that terminal only, and stays off the screen
+and out of your shell history. Never write it into a command (`export REACTOR_ACCESS_KEY=rxk_...` would keep it in
+your history), a file you commit, or a chat.
 
 ```sh
-export REACTOR_ACCESS_KEY=rxk_...           # macOS/Linux
-$env:REACTOR_ACCESS_KEY = "rxk_..."         # Windows PowerShell
+printf 'Access key: '; read -rs REACTOR_ACCESS_KEY; echo; export REACTOR_ACCESS_KEY   # macOS/Linux
+```
+
+```powershell
+$env:REACTOR_ACCESS_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "Access key" -AsSecureString)).Password   # Windows PowerShell
 ```
 
 ## 3. The workflow: one Reactor history per dataset history

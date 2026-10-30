@@ -38,6 +38,8 @@ flowchart LR
 | `retrieval.py` | the index, routing, evidence building (`HistoryIndex`) |
 | `run.py` | the benchmark driver: one Reactor history per dataset history, via `reactor/client.py` |
 | `make_predictions.py` | results → `predictions.jsonl`: citation rules, abstention, late-reply recovery |
+| `listen.py` | after a timeout, listens on the Reactor history (sending nothing) for the late answer |
+| `tests/` | `python -m unittest discover tests` |
 | `eval_retrieval.py` | offline retrieval metrics on dev splits (no Reactor calls) |
 | `run_v2.py` | the v2 driver (section 7), not used for the test predictions |
 | `app.py` | the Recall demo (section 11) |
@@ -91,10 +93,15 @@ Following the organisers' guidance on Discord:
 
 - **One Reactor history per dataset history**, started with `--new-history`, never reset mid-history.
 - **`--timeout 600`** for every question.
-- **Timeouts are retried once in the same Reactor history**, 30 s later; the client keeps retrying while the
-  previous request hasn't cleared (`previous_pending`).
+- **A timeout doesn't cancel the question on Reactor's side**, so the driver first sends nothing and listens on the
+  same Reactor history for up to 120 s for its late answer (`listen.py`, with the client's backoff). Only if none
+  arrives is the question asked once more in the same history; the client keeps retrying while the previous
+  request hasn't cleared (`previous_pending`). (The first part of the test run, up to `v1.1-test-run`, retried
+  after 30 s without listening.)
 - **Late answers are recovered.** If Reactor's final answer to a timed-out question arrives later, in another
   question's `late_replies` (matched by its ref), it is recorded as that question's answer, marked `recovered`.
+  `make_predictions.py` keeps exactly one line per question: the original question's late answer over a retry's,
+  otherwise the earlier of two answered lines (`tests/test_make_predictions.py`).
 - **Resume without a reset.** After a restart, the dataset history in progress continues in its Reactor history
   (the agent's current one), before any other history is started.
 

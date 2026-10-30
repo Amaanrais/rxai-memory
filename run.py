@@ -11,8 +11,10 @@ appended to --out at once; a rerun skips the questions already answered there an
 refusals, errors). The excerpts sent and suggest_citations() for each question go to --evidence-log (default:
 <out>.evidence.jsonl), which make_predictions.py reads.
 
-The client waits --timeout seconds (default 600). A question that times out is asked once more in the same Reactor
-history after --retry-wait seconds (default 30); the client itself retries while the previous request is pending.
+The client waits --timeout seconds (default 600). A timeout doesn't cancel the question on Reactor's side, so for a
+question that times out the driver first sends nothing and listens on the same Reactor history for up to --late-wait
+seconds (default 120; listen.py) for its late answer, recorded as a "recovered" line. Only if none arrives is the
+question asked once more in the same Reactor history; the client retries while the previous request is pending.
 A rerun resumes without a reset: if the dataset history of the latest result line has an answered question, it
 carries on in that line's Reactor history (the agent's current one) and does it first; any other dataset history
 gets --new-history. If the agent's current history has changed meanwhile, that one starts afresh too. A timed-out
@@ -34,6 +36,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from eval_retrieval import read_jsonl, stream_histories
+from listen import wait_for_late
 from make_predictions import recover_late
 from retrieval import HistoryIndex, is_aggregate
 
@@ -104,8 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True, help="results.jsonl, appended to")
     parser.add_argument("--evidence-log", type=Path, help="default: <out>.evidence.jsonl, appended to")
     parser.add_argument("--timeout", default="600", help="passed to client.py (seconds; default 600)")
-    parser.add_argument("--retry-wait", type=float, default=30.0,
-                        help="seconds to wait before asking a timed-out question again, once (default 30)")
+    parser.add_argument("--late-wait", type=float, default=120.0,
+                        help="seconds to listen for a timed-out question's late answer before asking it again, "
+                             "once (default 120)")
     parser.add_argument("--client", type=Path, default=ROOT / "reactor" / "client.py")
     args = parser.parse_args(argv)
     evidence_log = args.evidence_log or args.out.with_suffix(".evidence.jsonl")
@@ -141,6 +145,17 @@ def main(argv: list[str] | None = None) -> int:
             out.flush()
             lines.append(result)
             for line in recover_late(lines):
+                out.write(json.dumps(line) + "\n")
+                out.flush()
+                lines.append(line)
+                print(f"  recovered {line['question_id']}'s late answer (ref {line['ref']}): "
+                      f"{line['answer']!s:.60}", file=sys.stderr)
+
+        def record_late(question_id: str, late: list[dict]) -> None:
+            """Record the answers to earlier timed-out questions among final answers heard while listening."""
+            probe = {"question_id": question_id, "late_replies": late}  # not written: only what it recovers
+            for line in recover_late(lines + [probe]):
+                line["recovered"]["via"] = "listening after the timeout"
                 out.write(json.dumps(line) + "\n")
                 out.flush()
                 lines.append(line)
@@ -195,10 +210,19 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     record(result)
                     if result.get("status") == "timeout" and not retried:
-                        print(f"  {q['question_id']}: timeout after {time.monotonic() - started:.0f}s; asking "
-                              f"again in the same Reactor history in {args.retry_wait:g}s", file=sys.stderr)
                         retried = True
-                        time.sleep(args.retry_wait)
+                        print(f"  {q['question_id']}: timeout after {time.monotonic() - started:.0f}s; listening up "
+                              f"to {args.late_wait:g}s for its late answer (ref {result.get('ref')})", file=sys.stderr)
+                        heard = wait_for_late(args.base_url, args.agent_id, reactor_history,
+                                              [result["ref"]] if result.get("ref") else [], args.late_wait)
+                        record_late(q["question_id"], heard)
+                        answer = next((line for line in reversed(lines) if line.get("status") == "answered"
+                                       and line.get("question_id") == q["question_id"]), None)
+                        if answer:
+                            result = answer
+                            break
+                        print(f"  {q['question_id']}: no late answer; asking again in the same Reactor history",
+                              file=sys.stderr)
                         continue
                     break
                 took = time.monotonic() - started

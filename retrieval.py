@@ -34,6 +34,11 @@ tell told telling remind reminded say said saying mention mentioned mentioning r
 recalled discuss discussed previous previously earlier conversation chat
 """.split())
 TOKEN = re.compile(r"[a-z0-9]+")
+# how a question refers back to the past, not what it asks about: never a missing word
+FRAMING = frozenset("""
+remind remember recall mention previous previously earlier before conversation chat talk discuss ask asked look
+looking back wonder wondering curious help again thinking think going last time
+""".split()) | frozenset("""conversation chatted talked discussed mentioned reminded""".split())
 
 
 def stem(word: str) -> str:
@@ -90,6 +95,9 @@ class HistoryIndex:
         self.avgdl = sum(lengths) / len(lengths) if lengths else 1.0
         n = len(self.chunks)
         self.idf = {t: math.log(1 + (n - len(p) + 0.5) / (len(p) + 0.5)) for t, p in self.postings.items()}
+        idfs = sorted(self.idf.values())
+        self.median_idf = idfs[len(idfs) // 2] if idfs else 0.0
+        self.max_idf = math.log(1 + (n + 0.5) / 0.5)  # a word the history never uses
 
     def rank_chunks(self, question: str) -> list[tuple[int, float]]:
         """[(chunk index, BM25 score)] for every chunk matching a question term, best first."""
@@ -130,12 +138,16 @@ class HistoryIndex:
         return [sid for sid, _ in ranked[:n]]
 
     def evidence(self, question: str, budget: int | None = None, k_sessions: int | None = None,
-                 per_session_hits: int = 2, question_date: str | None = None) -> list[dict]:
+                 per_session_hits: int = 2, question_date: str | None = None, version: int = 1) -> list[dict]:
         """Excerpts of the top sessions, chronological: each session's best turns with one turn either side.
 
         ``budget`` and ``k_sessions`` default to the question's route (``route()``). With ``question_date``,
         each excerpt starts with how many days before it its session took place. The latest excerpt is
-        marked ``[most recent]``: for a value that changed, the latest mention wins."""
+        marked ``[most recent]``: for a value that changed, the latest mention wins.
+
+        ``version=2``: a hit turn too long for its room keeps the stretch with the most question words (``focus()``),
+        not its beginning. (Dropping a session's second hit turn when it scored under 0.8x its first lowered the
+        share of gold answers in the evidence on dev, so version 2 doesn't.)"""
         route_k, route_budget = route(question)
         budget = route_budget if budget is None else budget
         k_sessions = route_k if k_sessions is None else k_sessions
@@ -153,6 +165,7 @@ class HistoryIndex:
                 turns[ti].append(ci)
             elif len(turns) < per_session_hits:
                 turns[ti] = [ci]
+        weights = {t: self.idf[t] for t in set(tokenize(question)) if t in self.idf} if version >= 2 else None
         excerpts = []
         chronological = sorted(top)  # session order is chronological
         for si, _ in chronological:
@@ -164,21 +177,44 @@ class HistoryIndex:
             if si == chronological[-1][0]:
                 notes.append("[most recent]")
             header = "\n".join(notes)
-            text = self._excerpt(si, hits[si], share - len(header) - 1)
+            text = self._excerpt(si, hits[si], share - len(header) - 1, weights)
             excerpts.append({"id": session["session_id"], "date": session["date"],
                              "text": f"{header}\n{text}" if header else text})
         return excerpts
 
-    def _excerpt(self, si: int, hit_turns: dict[int, list[int]], share: int) -> str:
+    def missing_words(self, question: str, evidence: list[dict], limit: int = 4) -> list[str]:
+        """The question's content words found nowhere in ``evidence``, rarest first: those rarer than the
+        history's median word, or absent from the history. Framing words (remind, previous, chat...) don't count."""
+        sent = {t for e in evidence for t in tokenize(e["text"])}
+        words = {}
+        for word in TOKEN.findall(question.lower()):
+            if word in STOPWORDS or word in FRAMING:
+                continue
+            term = stem(word)
+            if term in STOPWORDS or term in FRAMING or term in sent or term in words:
+                continue
+            idf = self.idf.get(term, self.max_idf)
+            if idf > self.median_idf:
+                words[term] = (idf, word)
+        return [word for _, word in sorted(words.values(), key=lambda w: -w[0])[:limit]]
+
+    def _excerpt(self, si: int, hit_turns: dict[int, list[int]], share: int,
+                 weights: dict[str, float] | None = None) -> str:
         turns = self.sessions[si]["turns"]
-        hit_text = {ti: self._hit_text(turns[ti], cis) for ti, cis in hit_turns.items()}
+        if weights is None:
+            hit_text = {ti: self._hit_text(turns[ti], cis) for ti, cis in hit_turns.items()}
+        else:
+            hit_text = {ti: f"{turns[ti]['role']}: {turns[ti]['content']}" for ti in hit_turns}
         neighbours = sorted({n for ti in hit_turns for n in (ti - 1, ti + 1)
                              if 0 <= n < len(turns) and n not in hit_turns})
         # the hits keep their text first; the neighbours share what is left, up to NEIGHBOUR_CHARS each
         hit_chars = sum(len(t) + 1 for t in hit_text.values())
         if hit_chars > share:
             cap = share // max(len(hit_text), 1) - 1
-            hit_text = {ti: clip(t, cap) for ti, t in hit_text.items()}
+            if weights is None:
+                hit_text = {ti: clip(t, cap) for ti, t in hit_text.items()}
+            else:
+                hit_text = {ti: focus(t, cap, weights) for ti, t in hit_text.items()}
             hit_chars = sum(len(t) + 1 for t in hit_text.values())
         room = share - hit_chars - 6 * len(neighbours)
         cap = min(NEIGHBOUR_CHARS, room // len(neighbours)) if neighbours else 0
@@ -224,6 +260,41 @@ def parse_date(value: str) -> date:
 
 def days_before(session_date: str, question_date: str) -> int:
     return (parse_date(question_date) - parse_date(session_date)).days
+
+
+def focus(text: str, limit: int, weights: dict[str, float]) -> str:
+    """``text`` cut to ``limit`` characters around the stretch covering the most question words (each distinct word
+    counted once, by idf), its role prefix kept, cuts marked "..."; without any question word, its beginning."""
+    if len(text) <= limit:
+        return text
+    prefix, _, body = text.partition(": ")
+    prefix += ": "
+    room = limit - len(prefix) - 6  # two "..." marks
+    hits = []
+    for m in TOKEN.finditer(body.lower()):
+        if m.group() not in STOPWORDS and stem(m.group()) in weights:
+            hits.append((m.start(), stem(m.group())))
+    if room <= 0 or not hits:
+        return clip(text, limit)
+    # slide over the hits: the window [hits[left], hits[right]] spanning under ``room`` with the best coverage
+    counts: dict[str, int] = defaultdict(int)
+    covered, best, best_span, left = 0.0, -1.0, (0, 0), 0
+    for right, (pos, term) in enumerate(hits):
+        counts[term] += 1
+        if counts[term] == 1:
+            covered += weights[term]
+        while pos - hits[left][0] >= room:
+            gone = hits[left][1]
+            counts[gone] -= 1
+            if not counts[gone]:
+                covered -= weights[gone]
+            left += 1
+        if covered > best:
+            best, best_span = covered, (hits[left][0], pos)
+    # centre the slack around the winning stretch
+    start = max(0, min(best_span[0] - (room - (best_span[1] - best_span[0])) // 2, len(body) - room))
+    end = start + room
+    return prefix + ("..." if start else "") + body[start:end] + ("..." if end < len(body) else "")
 
 
 def clip(text: str, limit: int) -> str:

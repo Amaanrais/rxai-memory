@@ -1,6 +1,6 @@
 """Offline retrieval metrics for retrieval.py on a dev split: no Reactor calls.
 
-    python eval_retrieval.py dev [--k 1 3 5 10] [--cite 2] [--limit N] [--misses FILE]
+    python eval_retrieval.py dev [--k 1 3 5 10] [--cite 2] [--limit N] [--misses FILE] [--version 2]
 
 For answerable questions, per question_type and overall:
   hit@k    any gold session in the top k sessions
@@ -8,7 +8,10 @@ For answerable questions, per question_type and overall:
   sent     share of gold sessions among the excerpts evidence() would send
   F1@cite  evidence F1 if the top --cite sessions were cited
   F1@sugg  evidence F1 of HistoryIndex.suggest_citations()
+  ans∈ev   the gold answer (or an alias), normalized as score.py does, appears in the evidence sent
+  hint     share of questions given the missing-words hint (run_v2.py), also shown for unanswerable ones
 Then the top-1 session score, answerable vs unanswerable: a first look at an abstention threshold.
+--version picks HistoryIndex.evidence()'s version (1: what run.py sends; 2: what run_v2.py sends).
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from retrieval import HistoryIndex
+from score import answer_matched
 
 HISTORY_ID = re.compile(r'\s*\{\s*"history_id"\s*:\s*"([^"]+)"')
 
@@ -68,6 +72,7 @@ def main() -> int:
     ap.add_argument("--cite", type=int, default=2, help="sessions cited for F1@cite")
     ap.add_argument("--limit", type=int, help="an evenly spread sample of N questions")
     ap.add_argument("--misses", type=Path, help="write answerable questions with no gold session in the top 5")
+    ap.add_argument("--version", type=int, default=1, choices=(1, 2), help="evidence() version")
     args = ap.parse_args()
 
     questions = read_jsonl(args.split / "questions.jsonl")
@@ -82,6 +87,7 @@ def main() -> int:
     depth = max(max(args.k), args.cite, 5)
     rows: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     top1 = {False: [], True: []}
+    hinted = {False: [], True: []}
     misses = []
     started, done = time.time(), 0
     # one HistoryIndex per history_id, built when its line streams past and dropped after its questions
@@ -91,11 +97,14 @@ def main() -> int:
             g = gold[q["question_id"]]
             ranked = index.search(q["question"], k_sessions=depth)
             top1[g["abstain"]].append(ranked[0][1] if ranked else 0.0)
+            excerpts = index.evidence(q["question"], question_date=q["question_date"], version=args.version)
+            hint = float(bool(index.missing_words(q["question"], excerpts)))
+            hinted[g["abstain"]].append(hint)
             if g["abstain"]:
                 continue
             ids = [sid for sid, _ in ranked]
             ev = set(g["evidence"])
-            sent = {e["id"] for e in index.evidence(q["question"], question_date=q["question_date"])}
+            sent = {e["id"] for e in excerpts}
             m = {}
             for k in args.k:
                 m[f"hit@{k}"] = float(bool(ev & set(ids[:k])))
@@ -103,6 +112,8 @@ def main() -> int:
             m["sent"] = len(ev & sent) / len(ev)
             m[f"F1@{args.cite}"] = f1(ids[:args.cite], ev)
             m["F1@sugg"] = f1(index.suggest_citations(q["question"]), ev)
+            m["ans∈ev"] = float(answer_matched("\n".join(e["text"] for e in excerpts), g))
+            m["hint"] = hint
             for key in (g["question_type"], "all"):
                 for name, value in m.items():
                     rows[key][name].append(value)
@@ -115,7 +126,7 @@ def main() -> int:
     if by_history:
         print(f"warning: {len(by_history)} histories not found in histories.jsonl", file=sys.stderr)
 
-    names = [f"{p}@{k}" for p in ("hit", "all") for k in args.k] + ["sent", f"F1@{args.cite}", "F1@sugg"]
+    names = [f"{p}@{k}" for p in ("hit", "all") for k in args.k] + ["sent", f"F1@{args.cite}", "F1@sugg", "ans∈ev", "hint"]
     order = sorted(k for k in rows if k != "all") + ["all"]
     width = max(len(k) for k in order)
     print(f"\n{'type':<{width}}  {'n':>4}  " + "  ".join(f"{n:>7}" for n in names))
@@ -124,6 +135,10 @@ def main() -> int:
         print(f"{key:<{width}}  {len(r['sent']):>4}  " + "  ".join(f"{sum(r[n]) / len(r[n]):7.3f}" for n in names))
     print(f"\ntop-1 session score  answerable    {quantiles(top1[False])}")
     print(f"                     unanswerable  {quantiles(top1[True])}")
+    for abstain, label in ((False, "answerable"), (True, "unanswerable")):
+        n = len(hinted[abstain])
+        print(f"missing-words hint   {label:<13} {int(sum(hinted[abstain]))}/{n}"
+              + (f" = {sum(hinted[abstain]) / n:.3f}" if n else ""))
     print(f"\n{done} histories in {time.time() - started:.0f}s")
 
     if args.misses:

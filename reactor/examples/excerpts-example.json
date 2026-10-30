@@ -1,0 +1,6 @@
+[
+  {"id": "s_example0001", "date": "2023/05/20 (Sat) 02:21",
+   "text": "user: We booked the hall for the wedding in May.\nassistant: May is a lovely month for it."},
+  {"id": "s_example0002", "date": "2023/05/27 (Sat) 10:05",
+   "text": "user: Update: the wedding moved to June, same hall."}
+]

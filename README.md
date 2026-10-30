@@ -50,6 +50,7 @@ The format is described in [format.md](format.md).
 Reactor must provide the final answer. Your own code does everything around it: indexing, retrieval, preprocessing, deciding what to send.
 
 - Each team gets its own Reactor agent, an access key and a participant kit with `client.py` and a minimal `run_benchmark.py` example (keyword retrieval, history resets, result collection). The kit and keys are distributed through the event platform.
+- The kit is in [`reactor/`](reactor/): start with [`reactor/QUICKSTART.md`](reactor/QUICKSTART.md); [`reactor/PARTICIPANTS.md`](reactor/PARTICIPANTS.md) is the full guide (team URLs and keys, histories, evidence, loading a whole history, browsing, errors).
 - `client.py` sends your question with your passages labelled `[E1]`, `[E2]`, ..., asks Reactor to cite them, and maps the cited labels back to your passage ids. Use session ids as passage ids and the citations go straight into your submission.
 - Pass the question's date with `--question-date`, and put each session's date into its passage text: temporal questions need both.
 - The client limits a message to 16,000 characters of question and evidence by default. An average conversation is about 10,000 characters, so send selected turns or snippets, not whole conversations.

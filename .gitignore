@@ -1,0 +1,7 @@
+dev/
+dev-large/
+test/
+*.tar.gz
+*.jsonl
+!uncued_assistant.jsonl
+__pycache__/

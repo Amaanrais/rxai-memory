@@ -34,7 +34,7 @@ const DECK = {
   ],
 
   retrieval: [
-    ["Pure Python stdlib", "No GPU, no model downloads: one BM25 index per history, built in milliseconds."],
+    ["Pure Python stdlib", "No GPU, no model downloads: one BM25 index per history, built in under a second for a 200-conversation test history."],
     ["Question routing", "Counting, totals, ordering questions get more sessions and a bigger budget."],
     ["Focused trimming", "A long turn keeps the stretch with the most question words, not its first 1,500 chars."],
     ["Leading session", "When the top session clearly wins, it gets up to half the budget."],

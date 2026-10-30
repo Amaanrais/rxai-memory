@@ -4,4 +4,5 @@ test/
 *.tar.gz
 *.jsonl
 !uncued_assistant.jsonl
+!reactor/examples/*-example.jsonl
 __pycache__/

@@ -17,6 +17,13 @@ from datetime import date, datetime
 
 WINDOW = 1500
 NEIGHBOUR_CHARS = 600
+LEAD_RATIO = 0.6  # version 2: a top session leads when the next scores under this share of it
+TIME_CUE_LABEL = "user (elsewhere in this chat): "
+RELATIVE_TIME = re.compile(
+    r"\b(?:ago|yesterday|the other day|the day before"
+    r"|(?:last|this past|earlier this|later this)\s+(?:week|weekend|month|year|night|summer|spring|fall|autumn|winter"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", re.IGNORECASE)
+SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 K1, B = 1.2, 0.75
 
 STOPWORDS = frozenset("""
@@ -138,7 +145,8 @@ class HistoryIndex:
         return [sid for sid, _ in ranked[:n]]
 
     def evidence(self, question: str, budget: int | None = None, k_sessions: int | None = None,
-                 per_session_hits: int = 2, question_date: str | None = None, version: int = 1) -> list[dict]:
+                 per_session_hits: int = 2, question_date: str | None = None, version: int = 1,
+                 lead: bool | None = None, time_cues: bool | None = None) -> list[dict]:
         """Excerpts of the top sessions, chronological: each session's best turns with one turn either side.
 
         ``budget`` and ``k_sessions`` default to the question's route (``route()``). With ``question_date``,
@@ -147,7 +155,13 @@ class HistoryIndex:
 
         ``version=2``: a hit turn too long for its room keeps the stretch with the most question words (``focus()``),
         not its beginning. (Dropping a session's second hit turn when it scored under 0.8x its first lowered the
-        share of gold answers in the evidence on dev, so version 2 doesn't.)"""
+        share of gold answers in the evidence on dev, so version 2 doesn't.) Also, unless turned off:
+        - ``lead``: when the top session clearly leads (the next scores under ``LEAD_RATIO`` x it, as in
+          ``suggest_citations()``), it gets up to half the budget, and the others share the rest;
+        - ``time_cues``: for an aggregate question (``is_aggregate()``), each excerpt adds its session's user
+          sentences that say when something happened ("last month", "three weeks ago"), wherever they are."""
+        lead = version >= 2 if lead is None else lead
+        time_cues = version >= 2 if time_cues is None else time_cues
         route_k, route_budget = route(question)
         budget = route_budget if budget is None else budget
         k_sessions = route_k if k_sessions is None else k_sessions
@@ -166,21 +180,51 @@ class HistoryIndex:
             elif len(turns) < per_session_hits:
                 turns[ti] = [ci]
         weights = {t: self.idf[t] for t in set(tokenize(question)) if t in self.idf} if version >= 2 else None
-        excerpts = []
+        cues = time_cues and is_aggregate(question)
         chronological = sorted(top)  # session order is chronological
-        for si, _ in chronological:
+        latest = chronological[-1][0]
+
+        def excerpt(si: int, room: int) -> str:
             session = self.sessions[si]
             notes = []
             if question_date:
                 days = days_before(session["date"], question_date)
                 notes.append(f"({days} day{'' if days == 1 else 's'} before the question date)")
-            if si == chronological[-1][0]:
+            if si == latest:
                 notes.append("[most recent]")
             header = "\n".join(notes)
-            text = self._excerpt(si, hits[si], share - len(header) - 1, weights)
-            excerpts.append({"id": session["session_id"], "date": session["date"],
-                             "text": f"{header}\n{text}" if header else text})
-        return excerpts
+            said = self._time_sentences(si, room // 2) if cues else []
+            extra = sum(len(s) + len(TIME_CUE_LABEL) + 1 for s in said)
+            text = self._excerpt(si, hits[si], room - len(header) - 1 - extra, weights)
+            said = [s for s in said if s not in text]
+            text = "\n".join([text] + [TIME_CUE_LABEL + s for s in said])
+            return f"{header}\n{text}" if header else text
+
+        texts: dict[int, str] = {}
+        if lead and len(top) > 1 and top[1][1] < LEAD_RATIO * top[0][1]:
+            texts[top[0][0]] = excerpt(top[0][0], max(share, budget // 2))
+            share = (budget - len(texts[top[0][0]])) // (len(top) - 1)
+        for si, _ in chronological:
+            if si not in texts:
+                texts[si] = excerpt(si, share)
+        return [{"id": self.sessions[si]["session_id"], "date": self.sessions[si]["date"], "text": texts[si]}
+                for si, _ in chronological]
+
+    def _time_sentences(self, si: int, room: int) -> list[str]:
+        """The user's sentences in session ``si`` that say when something happened, in order, within ``room``."""
+        found: list[str] = []
+        used = 0
+        for turn in self.sessions[si]["turns"]:
+            if turn["role"] != "user":
+                continue
+            for sentence in SENTENCE.split(turn["content"]):
+                sentence = clip(sentence.strip(), 300)
+                if sentence and RELATIVE_TIME.search(sentence) and sentence not in found:
+                    used += len(sentence) + len(TIME_CUE_LABEL) + 1
+                    if used > room:
+                        return found
+                    found.append(sentence)
+        return found
 
     def missing_words(self, question: str, evidence: list[dict], limit: int = 4) -> list[str]:
         """The question's content words found nowhere in ``evidence``, rarest first: those rarer than the

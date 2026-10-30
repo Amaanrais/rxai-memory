@@ -5,11 +5,15 @@
     python make_predictions.py results-v2.jsonl --questions dev/questions.jsonl --out predictions-v2.jsonl
 
 Changes from run.py:
-- evidence(version=2): a hit turn too long for its room keeps the stretch with the most question words;
+- evidence(version=2): a hit turn too long for its room keeps the stretch with the most question words; a
+  clearly leading top session gets up to half the budget; for aggregate questions, each excerpt adds the user's
+  sentences that say when something happened, from anywhere in its session (retrieval.py, evidence());
+- aggregate questions are asked to work their answer out before the FINAL ANSWER line (WORK_IT_OUT) instead of
+  "single value only";
 - the missing-words hint: the question's rarer content words that appear nowhere in the evidence (at most
   HINT_WORDS), named in the question so that the agent abstains on a near miss. The evidence log records them.
-Everything else (one HistoryIndex and --new-history per dataset history, instructions, --max-chars, results
-appended at once, answered questions skipped on rerun, latency/ETA) is run.py's.
+Everything else (one HistoryIndex and --new-history per dataset history, the other instructions, --max-chars,
+results appended at once, answered questions skipped on rerun, latency/ETA) is run.py's.
 """
 from __future__ import annotations
 
@@ -24,10 +28,14 @@ from pathlib import Path
 
 from eval_retrieval import read_jsonl, stream_histories
 from retrieval import HistoryIndex, is_aggregate
-from run import MAX_CHARS, ROOT, ROUTED_MAX_CHARS, client, clock, prompt
+from run import MAX_CHARS, ROOT, ROUTED_MAX_CHARS, UPDATE_INSTRUCTION, client, clock, is_update
 
 VERSION = 2
 HINT_WORDS = 4
+LABELS = "Put the [E#] labels of the passages you used on the FINAL ANSWER line itself, e.g. 'June [E2]'."
+SINGLE = "Answer with the single value only, no hedging."  # with LABELS: run.py's INSTRUCTIONS
+WORK_IT_OUT = ("If the answer must be computed from several passages (a difference, total, count or order), work it "
+               "out step by step before the FINAL ANSWER line; that line holds only the result.")
 
 
 def hint(words: list[str]) -> str:
@@ -36,9 +44,14 @@ def hint(words: list[str]) -> str:
 
 
 def prompt_v2(question: str, missing: list[str]) -> str:
-    """run.py's prompt, plus the hint when some question words are missing from the evidence."""
-    text = prompt(question)
-    return f"{text} {hint(missing)}" if missing else text
+    """run.py's prompt, except that an aggregate question is asked to work its answer out, plus the hint when
+    some question words are missing from the evidence."""
+    parts = [question.strip(), LABELS, WORK_IT_OUT if is_aggregate(question) else SINGLE]
+    if is_update(question):
+        parts.append(UPDATE_INSTRUCTION)
+    if missing:
+        parts.append(hint(missing))
+    return " ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> int:

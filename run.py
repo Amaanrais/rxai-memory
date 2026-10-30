@@ -10,10 +10,19 @@ parsed, and each gets one HistoryIndex and one --new-history, reused for all its
 appended to --out at once; a rerun skips the questions already answered there and asks the others again (timeouts,
 refusals, errors). The excerpts sent and suggest_citations() for each question go to --evidence-log (default:
 <out>.evidence.jsonl), which make_predictions.py reads.
+
+The client waits --timeout seconds (default 600). A question that times out is asked once more in the same Reactor
+history after --retry-wait seconds (default 30); the client itself retries while the previous request is pending.
+A rerun resumes without a reset: if the dataset history of the latest result line has an answered question, it
+carries on in that line's Reactor history (the agent's current one) and does it first; any other dataset history
+gets --new-history. If the agent's current history has changed meanwhile, that one starts afresh too. A timed-out
+question's answer that arrives later, in another question's late_replies, is recorded for it as an answered line
+marked "recovered" (make_predictions.recover_late()).
 """
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -25,6 +34,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from eval_retrieval import read_jsonl, stream_histories
+from make_predictions import recover_late
 from retrieval import HistoryIndex, is_aggregate
 
 ROOT = Path(__file__).resolve().parent
@@ -70,6 +80,21 @@ def clock(seconds: float) -> str:
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def resume_point(lines: list[dict], dataset_history: dict[str, str]) -> tuple[str, str] | None:
+    """(dataset history, Reactor history) to carry on in without a reset: the dataset history of the latest result
+    line the client wrote, if it has an answered question, with that line's Reactor history. Only the most
+    recently active one: the agent's current history is the last one used."""
+    direct = [r for r in lines if not r.get("recovered") and r.get("history_id")
+              and r.get("question_id") in dataset_history]
+    if not direct:
+        return None
+    last = direct[-1]
+    current = dataset_history[last["question_id"]]
+    if any(r.get("status") == "answered" and dataset_history.get(r.get("question_id")) == current for r in lines):
+        return current, last["history_id"]
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="questions.jsonl -> client.py -> results.jsonl")
     parser.add_argument("--questions", type=Path, required=True)
@@ -78,7 +103,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agent-id", required=True)
     parser.add_argument("--out", type=Path, required=True, help="results.jsonl, appended to")
     parser.add_argument("--evidence-log", type=Path, help="default: <out>.evidence.jsonl, appended to")
-    parser.add_argument("--timeout", help="passed to client.py (seconds)")
+    parser.add_argument("--timeout", default="600", help="passed to client.py (seconds; default 600)")
+    parser.add_argument("--retry-wait", type=float, default=30.0,
+                        help="seconds to wait before asking a timed-out question again, once (default 30)")
     parser.add_argument("--client", type=Path, default=ROOT / "reactor" / "client.py")
     args = parser.parse_args(argv)
     evidence_log = args.evidence_log or args.out.with_suffix(".evidence.jsonl")
@@ -86,29 +113,54 @@ def main(argv: list[str] | None = None) -> int:
         print("set REACTOR_ACCESS_KEY first (reactor/QUICKSTART.md, step 2)", file=sys.stderr)
         return 2
 
-    answered = ({r.get("question_id") for r in read_jsonl(args.out) if r.get("status") == "answered"}
-                if args.out.exists() else set())
+    all_questions = read_jsonl(args.questions)
+    dataset_history = {q["question_id"]: q["history_id"] for q in all_questions}
+    lines = read_jsonl(args.out) if args.out.exists() else []
+    late = recover_late(lines)  # answers to earlier timeouts that arrived late, not yet recorded
+    answered = {r.get("question_id") for r in lines + late if r.get("status") == "answered"}
     groups: dict[str, list[dict]] = defaultdict(list)
-    for q in read_jsonl(args.questions):
+    for q in all_questions:
         if q["question_id"] not in answered:
             groups[q["history_id"]].append(q)
     total = sum(map(len, groups.values()))
+    resume = resume_point(lines, dataset_history)
+    resume = resume if resume and resume[0] in groups else None
     print(f"{total} question(s) in {len(groups)} dataset histories to ask "
           f"({len(answered)} already answered in {args.out})", file=sys.stderr)
-    if not total:
-        return 0
+    if resume:
+        print(f"resuming dataset history {resume[0]} in Reactor history {resume[1]} (no reset)", file=sys.stderr)
 
-    timeout = ["--timeout", args.timeout] if args.timeout else []
+    timeout = ["--timeout", args.timeout]
     asked, spent = 0, 0.0
     with tempfile.TemporaryDirectory() as tmp, args.out.open("a", encoding="utf-8") as out, \
             evidence_log.open("a", encoding="utf-8") as log:
-        for history in stream_histories(args.histories, set(groups)):
+
+        def record(result: dict) -> None:
+            """Append a result line, then any late answers it carries for earlier timed-out questions."""
+            out.write(json.dumps(result) + "\n")
+            out.flush()
+            lines.append(result)
+            for line in recover_late(lines):
+                out.write(json.dumps(line) + "\n")
+                out.flush()
+                lines.append(line)
+                print(f"  recovered {line['question_id']}'s late answer (ref {line['ref']}): "
+                      f"{line['answer']!s:.60}", file=sys.stderr)
+
+        for line in late:
+            record(line)
+        if not total:
+            return 0
+        # the resumed dataset history first: any --new-history before it would end its Reactor history
+        first = stream_histories(args.histories, {resume[0]}) if resume else iter(())
+        rest = stream_histories(args.histories, set(groups) - ({resume[0]} if resume else set()))
+        for history in itertools.chain(first, rest):
             questions = groups.pop(history["history_id"])
             index = HistoryIndex(history)
-            new = client(args, "--new-history", *timeout)  # one Reactor history per dataset history
-            if new.get("status") != "history":
-                print(f"--new-history failed: {new.get('error') or new}", file=sys.stderr)
-                return 2
+            if resume and history["history_id"] == resume[0]:
+                reactor_history = resume[1]
+            else:
+                reactor_history = None
             for q in questions:
                 evidence = index.evidence(q["question"], question_date=q["question_date"])
                 suggested = index.suggest_citations(q["question"])
@@ -118,17 +170,38 @@ def main(argv: list[str] | None = None) -> int:
                 path = Path(tmp) / "evidence.json"
                 path.write_text(json.dumps(evidence), encoding="utf-8")
                 max_chars = ROUTED_MAX_CHARS if is_aggregate(q["question"]) else MAX_CHARS
-                extra = ["--history", new["history_id"], "--question", prompt(q["question"]),
-                         "--question-date", q["question_date"], "--question-id", q["question_id"],
-                         "--max-chars", str(max_chars), *timeout]
-                if evidence:
-                    extra += ["--evidence", str(path)]
                 started = time.monotonic()
-                result = client(args, *extra)
+                retried = fresh = False
+                while True:
+                    if reactor_history is None:
+                        new = client(args, "--new-history", *timeout)  # one Reactor history per dataset history
+                        if new.get("status") != "history":
+                            print(f"--new-history failed: {new.get('error') or new}", file=sys.stderr)
+                            return 2
+                        reactor_history = new["history_id"]
+                    extra = ["--history", reactor_history, "--question", prompt(q["question"]),
+                             "--question-date", q["question_date"], "--question-id", q["question_id"],
+                             "--max-chars", str(max_chars), *timeout]
+                    if evidence:
+                        extra += ["--evidence", str(path)]
+                    result = client(args, *extra)
+                    result.setdefault("question_id", q["question_id"])
+                    if (result.get("status") == "refused" and not fresh
+                            and result.get("code") in ("history_changed", "history_required")):
+                        # the resumed history is no longer the agent's current one: start this one afresh
+                        print(f"  {q['question_id']}: {result['code']}; starting a new Reactor history",
+                              file=sys.stderr)
+                        reactor_history, fresh = None, True
+                        continue
+                    record(result)
+                    if result.get("status") == "timeout" and not retried:
+                        print(f"  {q['question_id']}: timeout after {time.monotonic() - started:.0f}s; asking "
+                              f"again in the same Reactor history in {args.retry_wait:g}s", file=sys.stderr)
+                        retried = True
+                        time.sleep(args.retry_wait)
+                        continue
+                    break
                 took = time.monotonic() - started
-                result.setdefault("question_id", q["question_id"])
-                out.write(json.dumps(result) + "\n")
-                out.flush()
                 asked += 1
                 spent += took
                 average = spent / asked

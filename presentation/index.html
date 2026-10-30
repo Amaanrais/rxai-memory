@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RxAI Memory Retrieval</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --dim:#8b949e; --accent:#f2a33a; --accent2:#4fb6c9; }
+  * { box-sizing:border-box; margin:0; }
+  html, body { height:100%; background:var(--bg); color:var(--text); font:18px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #deck { height:100vh; overflow-y:auto; scroll-snap-type:y mandatory; scrollbar-width:none; }
+  section { height:100vh; scroll-snap-align:start; display:flex; flex-direction:column; justify-content:center;
+            padding:6vh 8vw; gap:3vh; }
+  h1 { font-size:clamp(2.4rem, 6vw, 4.6rem); line-height:1.05; letter-spacing:-.02em; }
+  h2 { font-size:clamp(1.6rem, 3.4vw, 2.6rem); letter-spacing:-.01em; }
+  h2 small, .kicker { display:block; font-size:.8rem; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); margin-bottom:.4em; }
+  .sub { font-size:1.3rem; color:var(--dim); max-width:46ch; }
+  .meta { color:var(--dim); font-size:.95rem; }
+  .grid { display:grid; gap:1.2rem; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:1.1rem 1.3rem; }
+  .card b { display:block; color:var(--accent2); margin-bottom:.25em; }
+  .stat { font-size:2.6rem; font-weight:700; color:var(--accent); line-height:1; }
+  .types { display:grid; grid-template-columns:auto 1fr; gap:.4rem 1.4rem; }
+  .types code { color:var(--accent2); font-size:.95rem; }
+  ol.steps { list-style:none; counter-reset:s; display:grid; gap:.8rem; max-width:52ch; }
+  ol.steps li { counter-increment:s; display:flex; gap:1rem; align-items:baseline; }
+  ol.steps li::before { content:counter(s); flex:none; width:2rem; height:2rem; border-radius:50%; display:grid; place-items:center;
+                        background:var(--panel); border:1px solid var(--accent); color:var(--accent); font-weight:700; }
+  .note { border-left:3px solid var(--accent); padding-left:1rem; color:var(--dim); }
+  svg { width:100%; height:auto; max-height:60vh; }
+  svg text { fill:var(--text); font-family:inherit; }
+  #nav { position:fixed; right:1.2rem; bottom:1rem; color:var(--dim); font-size:.85rem; }
+  #bar { position:fixed; left:0; top:0; height:3px; background:var(--accent); transition:width .2s; }
+  @media print { #deck { height:auto; overflow:visible; } section { page-break-after:always; } #nav, #bar { display:none; } }
+</style>
+</head>
+<body>
+<div id="bar"></div>
+<main id="deck"></main>
+<div id="nav"></div>
+<script src="data.js"></script>
+<script>
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+const cards = rows => `<div class="grid">${rows.map(([t, d]) => `<div class="card"><b>${esc(t)}</b>${esc(d)}</div>`).join("")}</div>`;
+const pct = v => v == null ? "pending" : `${Math.round(v * 100)}%`;
+const wrap = (text, n) => text.split(" ").reduce((ls, w) => ((ls.at(-1) + " " + w).trim().length > n ? ls.push(w) : ls[ls.length - 1] = (ls.at(-1) + " " + w).trim(), ls), [""]);
+
+// Pipeline: one box per stage with arrows between; SVG so it scales to any screen.
+function pipelineSvg(stages) {
+  const w = 190, h = 110, gap = 40, W = stages.length * (w + gap) - gap;
+  const boxes = stages.map((s, i) => {
+    const x = i * (w + gap), hl = s.name === "Reactor";
+    return `<rect x="${x}" y="0" width="${w}" height="${h}" rx="12" fill="${hl ? "#2a1f0d" : "#161b22"}" stroke="${hl ? "#f2a33a" : "#4fb6c9"}" stroke-width="1.5"/>
+      <text x="${x + w / 2}" y="32" text-anchor="middle" font-size="20" font-weight="700">${esc(s.name)}</text>
+      ${wrap(s.detail, 24).map((l, j) => `<text x="${x + w / 2}" y="${60 + j * 18}" text-anchor="middle" font-size="13" style="fill:#8b949e">${esc(l)}</text>`).join("")}
+      ${i < stages.length - 1 ? `<path d="M${x + w + 6} ${h / 2} h${gap - 14}" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>` : ""}`;
+  }).join("");
+  return `<svg viewBox="-4 -4 ${W + 8} ${h + 8}" role="img" aria-label="Pipeline: ${esc(stages.map(s => s.name).join(", "))}">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8b949e"/></marker></defs>${boxes}</svg>`;
+}
+
+// Horizontal bars on 0..1; a null value draws a dashed "pending" outline.
+function barsSvg(rows) {
+  const lw = 340, bw = 520, rh = 46;
+  return `<svg viewBox="0 0 ${lw + bw + 80} ${rows.length * rh}" role="img" aria-label="Results">${rows.map((r, i) => {
+    const y = i * rh, len = (r.value ?? 0) * bw, pending = r.value == null;
+    const bar = pending
+      ? `<rect x="${lw}" y="${y + 8}" width="${bw}" height="26" rx="6" fill="none" stroke="#30363d" stroke-dasharray="6 5"/>`
+      : `<rect x="${lw}" y="${y + 8}" width="${bw}" height="26" rx="6" fill="#161b22"/><rect x="${lw}" y="${y + 8}" width="${len}" height="26" rx="6" fill="#f2a33a"/>`;
+    return `<text x="${lw - 14}" y="${y + 27}" text-anchor="end" font-size="15">${esc(r.label)}</text>${bar}
+      <text x="${pending ? lw + bw / 2 : lw + len + 10}" y="${y + 27}" font-size="15" font-weight="700" ${pending ? 'text-anchor="middle" style="fill:#8b949e"' : ""}>${pct(r.value)}</text>`;
+  }).join("")}</svg>`;
+}
+
+// Before/after pair per split.
+function ablationSvg(rows) {
+  const lw = 120, bw = 420, rh = 70, max = Math.max(...rows.map(r => Math.max(r.before, r.after))) * 1.15;
+  return `<svg viewBox="0 0 ${lw + bw + 90} ${rows.length * rh}" role="img" aria-label="v1 versus v2">${rows.map((r, i) => {
+    const y = i * rh, a = r.before / max * bw, b = r.after / max * bw;
+    return `<text x="${lw - 14}" y="${y + 34}" text-anchor="end" font-size="16">${esc(r.label)}</text>
+      <rect x="${lw}" y="${y + 6}" width="${a}" height="22" rx="5" fill="#30363d"/><text x="${lw + a + 8}" y="${y + 23}" font-size="13" style="fill:#8b949e">v1 ${r.before.toFixed(3)}</text>
+      <rect x="${lw}" y="${y + 32}" width="${b}" height="22" rx="5" fill="#4fb6c9"/><text x="${lw + b + 8}" y="${y + 49}" font-size="13" font-weight="700">v2 ${r.after.toFixed(3)}</text>`;
+  }).join("")}</svg>`;
+}
+
+const D = DECK;
+const slides = [
+  `<span class="kicker">${esc(D.event)}</span><h1>${esc(D.title)}</h1><p class="sub">${esc(D.subtitle)}</p>
+   <p class="meta">${esc(D.team.join(" · "))} &nbsp;|&nbsp; <code>${esc(D.repo)}</code></p>`,
+  `<h2><small>The problem</small>One question, hundreds of conversations</h2>
+   <div class="grid">${D.problem.stats.map(s => `<div class="card"><div class="stat">${esc(s.value)}</div>${esc(s.label)}</div>`).join("")}</div>
+   <p class="note">Test histories hide near-miss conversations that look relevant but don't answer the question.</p>`,
+  `<h2><small>Question types</small>Five ways to need memory</h2>
+   <div class="types">${D.problem.types.map(([t, d]) => `<code>${esc(t)}</code><span>${esc(d)}</span>`).join("")}</div>`,
+  `<h2><small>Architecture</small>Our code picks the evidence, Reactor answers</h2>${pipelineSvg(D.pipeline)}`,
+  `<h2><small>Retrieval</small>Send the right 16k characters</h2>${cards(D.retrieval)}`,
+  `<h2><small>Prompting</small>Help a fast model be precise</h2>${cards(D.prompting)}`,
+  `<h2><small>Citations</small>Only cite what supports the answer</h2>
+   <ol class="steps">${D.citations.map(c => `<li>${esc(c)}</li>`).join("")}</ol><p class="note">${esc(D.citationNote)}</p>`,
+  `<h2><small>Results</small>Where we stand</h2>${barsSvg(D.results)}<p class="note">${esc(D.resultsNote)}</p>`,
+  `<h2><small>Evidence v2</small>Answer present in the evidence we send</h2>${ablationSvg(D.ablation)}
+   <p class="note">Focused trimming, leading-session budget and time sentences, measured offline before spending Reactor calls.</p>`,
+  `<h2><small>Next</small>What's next</h2><ol class="steps">${D.next.map(n => `<li>${esc(n)}</li>`).join("")}</ol>`,
+  `<h1>Thank you</h1><p class="sub">Questions?</p><p class="meta">${esc(D.team.join(" · "))}</p>`,
+];
+
+const deck = document.getElementById("deck");
+deck.innerHTML = slides.map((s, i) => `<section id="s${i + 1}">${s}</section>`).join("");
+const sections = [...deck.children];
+const current = () => Math.round(deck.scrollTop / deck.clientHeight);
+const go = i => sections[Math.max(0, Math.min(sections.length - 1, i))].scrollIntoView({ behavior: "smooth" });
+const status = () => {
+  const i = current();
+  document.getElementById("nav").textContent = `${i + 1} / ${sections.length}`;
+  document.getElementById("bar").style.width = `${(i + 1) / sections.length * 100}%`;
+};
+deck.addEventListener("scroll", status);
+addEventListener("keydown", e => {
+  if (["ArrowRight", "ArrowDown", "PageDown", " "].includes(e.key)) { e.preventDefault(); go(current() + 1); }
+  if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) { e.preventDefault(); go(current() - 1); }
+  if (e.key === "Home") go(0);
+  if (e.key === "End") go(sections.length - 1);
+});
+status();
+</script>
+</body>
+</html>

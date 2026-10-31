@@ -35,6 +35,11 @@ NOTE_DAYS = re.compile(r"^\((\d+) days? before the question date\)$")
 TURN = re.compile(r"^(user \(elsewhere in this chat\)|user|assistant): ", re.MULTILINE)
 WORD = re.compile(r"[A-Za-z0-9]+")
 SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+# below these, retrieval found nothing worth sending: the lowest top-1 score of any answerable question is 8.3 on dev
+# and 14.6 on dev-large, and its smallest evidence 2,701 characters; gibberish scores 0, "hello" about 6
+MIN_TOP_SCORE = 6.0
+MIN_EVIDENCE_CHARS = 200
+SET_NAMES = {"dev": "practice set", "test": "test set"}
 
 # the four questions of the "Try these" row: dev questions with a saved answer, one per kind of question
 DEMOS = [("A fact the user mentioned", "q_4feb114c6944"),
@@ -99,7 +104,9 @@ h1.question { font-size: 30px; line-height: 1.2; font-weight: 600; letter-spacin
 .answer { font-size: 40px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; color: var(--ink);
   margin-top: 6px; overflow-wrap: anywhere; }
 .answer.long { font-size: 28px; line-height: 1.25; }
-.answer.none { font-size: 24px; font-weight: 500; color: var(--muted); }
+.answer.calm { font-size: 22px; line-height: 1.35; font-weight: 500; letter-spacing: 0; color: var(--ink); }
+.pending { font-size: 15px; color: var(--muted); margin-top: 24px; }
+.scope { font-size: 14px; color: var(--muted); margin-bottom: 10px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .chip { font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 999px;
   padding: 4px 11px; text-decoration: none; white-space: nowrap; }
@@ -470,21 +477,32 @@ prediction = predict(qid, result, {"evidence": evidence})[0] if result else None
 cite_source = predict(qid, result, {"evidence": evidence})[1] if result else "-"
 cited = set(prediction["citations"]) if prediction else set()
 dates = {e["id"]: e["date"] for e in evidence}
-sent_chars = sum(len(e["text"]) for e in evidence) + len(question_text)
+evidence_chars = sum(len(e["text"]) for e in evidence)
+sent_chars = evidence_chars + len(question_text)
+top = index.search(question_text, k_sessions=1)
+# nothing relevant: no excerpts, a weak best match, or almost no text to send
+no_evidence = not evidence or (top[0][1] if top else 0.0) < MIN_TOP_SCORE or evidence_chars < MIN_EVIDENCE_CHARS
 words = keywords(question_text)
 
 # ---------- the sheet ----------
 
 with st.container(key="sheet"):
-    st.html(f'<h1 class="question">{html.escape(question_text)}</h1>'
-            f'<div class="meta">Asked {day(question_date)}, searched {n_sessions} conversations</div>')
+    who = "one user's chat history" + (" (the same user as the selected question)" if state.own else "")
+    st.html(f'<div class="scope">Searching {who}: {n_sessions} conversations, {SET_NAMES[split]}</div>'
+            f'<h1 class="question">{html.escape(question_text)}</h1>'
+            f'<div class="meta">Asked {day(question_date)}</div>')
 
     said = []  # the status, in plain words
-    if prediction is None:
-        answer_html = ('<div class="answer none">Reactor hasn\'t been asked this one yet. '
-                       'The sources Recall would send are below.</div>')
+    label = '<div class="answer-label">Answer</div>'  # only over a real answer
+    if prediction is None and no_evidence:
+        label, answer_html = "", ('<div class="answer-label">Recall</div><div class="answer calm">Nothing in this '
+                                  'user\'s conversations mentions that. Recall would say it doesn\'t know.</div>')
+    elif prediction is None:
+        label, answer_html = "", ('<div class="pending">' + ("Not sent to Reactor yet. Ask Reactor below to send it."
+                                  if live_ready else "Not sent to Reactor yet (live mode is off). Here\'s what "
+                                  "Recall would send it.") + "</div>")
     elif result.get("status") != "answered":
-        answer_html = '<div class="answer none">Reactor didn\'t answer in time.</div>'
+        label, answer_html = "", '<div class="pending">Reactor didn\'t answer in time.</div>'
         said.append('Recall treats this as "I don\'t know", with no sources.')
     elif prediction["abstain"]:
         answer_html = '<div class="answer">I don\'t know.</div>'
@@ -501,15 +519,15 @@ with st.container(key="sheet"):
     status = f'<div class="status">{" ".join(said)}</div>' if said else ""
     chips = "".join(f'<a class="chip" href="#src-{sid}">{day(dates[sid], year=False)} conversation</a>'
                     for sid in sorted(cited, key=lambda s: date_of(dates[s])) if sid in dates)
-    ratio = history_chars / max(sent_chars, 1)
-    st.html(f'<div class="answer-label">Answer</div>{answer_html}'
-            + (f'<div class="chips">{chips}</div>' if chips else "") + status
-            + f'<div class="efficiency">Read <b>{short(sent_chars)}</b> of {short(history_chars)} characters, '
-              f'{ratio:.0f}× less than the full history.'
-              f'<div class="bar" role="img" aria-label="{sent_chars / history_chars:.1%} of the history read">'
-              f'<span style="width:{min(sent_chars / history_chars, 1):.2%}"></span></div></div>')
+    efficiency = ""
+    if not no_evidence:  # a ratio only means something when real evidence was found
+        efficiency = (f'<div class="efficiency">Read <b>{short(sent_chars)}</b> of {short(history_chars)} '
+                      f'characters, {history_chars / sent_chars:.0f}× less than the full history.'
+                      f'<div class="bar" role="img" aria-label="{sent_chars / history_chars:.1%} of the history '
+                      f'read"><span style="width:{min(sent_chars / history_chars, 1):.2%}"></span></div></div>')
+    st.html(label + answer_html + (f'<div class="chips">{chips}</div>' if chips else "") + status + efficiency)
 
-    if live_ready and prediction is None and st.button("Ask Reactor"):
+    if live_ready and prediction is None and not no_evidence and st.button("Ask Reactor"):
         with st.spinner("Reactor is answering, usually within a minute..."):
             answer = ask_reactor(split, base["history_id"], qid, question_text, question_date, version,
                                  evidence, missing)
@@ -519,14 +537,18 @@ with st.container(key="sheet"):
     sources_tab, how_tab, results_tab = st.tabs(["Sources", "How it works", "Results"])
 
     with sources_tab:
-        intro = (f"{len(evidence)} conversations Recall sent to Reactor, oldest first."
-                 + (" Highlighted: the ones the answer cites." if cited else ""))
+        shown_evidence = [] if prediction is None and no_evidence else evidence
+        if not shown_evidence:
+            intro = "No conversation matches the question closely enough to send to Reactor."
+        else:
+            intro = (f"{len(evidence)} conversations Recall {'would send' if prediction is None else 'sent'} to "
+                     f"Reactor, oldest first." + (" Highlighted: the ones the answer cites." if cited else ""))
         parts = [f'<div class="sources-intro">{intro}</div>']
-        if missing:
+        if missing and shown_evidence:
             parts.append(f'<div class="hint">These words from the question appear nowhere in these conversations: '
                          f'<b>{html.escape(", ".join(missing))}</b>. If the answer depends on them, Reactor is told '
                          f'to say it doesn\'t know. This is how near-miss traps are caught.</div>')
-        for e in evidence:
+        for e in shown_evidence:
             days, recent, body = parse_excerpt(e["text"])
             is_cited = e["id"] in cited
             turns = turns_of(body)
@@ -550,8 +572,6 @@ with st.container(key="sheet"):
                          f'{tags}</div>'
                          f'<div class="snippet">{shown}<span class="open">Show conversation</span></div>'
                          f'</summary><div class="turns">{inner}</div></details>')
-        if not evidence:
-            parts.append('<div class="sources-intro">Nothing in this history matches the question\'s words.</div>')
         st.html("".join(parts))
 
     with how_tab:

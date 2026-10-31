@@ -94,7 +94,7 @@ const DECK = {
   rules: [
     ["Reactor answers", "Final answers come only from Reactor, through the organisers' client. No hand edits."],
     ["One history per user", "A fresh Reactor history per dataset history, never reset mid-history."],
-    ["Reliable runs", "600 s timeout, one retry in the same history, late answers recovered by their ref."],
+    ["Reliable runs", "600 s timeout; on a timeout, listen up to 120 s for the late answer before one retry. One prediction per question, unit-tested."],
     ["Reproducible", "Evidence logged per question; v1 and v1.1 drivers send byte-identical evidence on all 526 dev questions."],
   ],
 

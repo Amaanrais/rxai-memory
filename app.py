@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import streamlit as st
 
 from make_predictions import choose, predict
-from retrieval import STOPWORDS, HistoryIndex, is_aggregate, stem, tokenize
+from retrieval import STOPWORDS, HistoryIndex, is_aggregate, is_name_question, stem, tokenize
 from score import score_question, summarize
 
 ROOT = Path(__file__).resolve().parent
@@ -489,7 +489,9 @@ def resolve(turn: dict) -> SimpleNamespace:
     """Everything a reply needs: the saved (or live) answer, the evidence sent with it, and how much was read."""
     index, history_chars, n_sessions = load_index(turn["split"], turn["history"])
     qid, v = turn["qid"], turn["version"]
-    run = next((r for r in reversed(runs.get(qid, [])) if r["version"] == v), None) if qid else None
+    # a version 3 run counts for version 2 on any other than a name question: its evidence is version 2's
+    same = {v, 3} if v == 2 and not is_name_question(turn["question"]) else {v}
+    run = next((r for r in reversed(runs.get(qid, [])) if r["version"] in same), None) if qid else None
     live_key = (turn["split"], turn["history"], turn["question"], turn["date"], v)
     live_result = state.get("live", {}).get(live_key)
     if run and run["logged"]:

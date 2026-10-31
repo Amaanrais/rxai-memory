@@ -11,3 +11,4 @@ __pycache__/
 .taste-skill/
 presentation/video/build/
 presentation/video/*.mp4
+*.partial

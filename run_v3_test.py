@@ -1,25 +1,16 @@
-"""The test-run driver for version 3: run.py's driver with run_v3.py's evidence and question text.
+"""The driver for the submitted predictions: run.py's driver with run_v3.py's evidence and question text.
 
     python run_v3_test.py --questions test/questions.jsonl --histories test/histories.jsonl \\
         --base-url https://tNN.<domain> --agent-id agt_... --out results-test-v3.jsonl
     python make_predictions.py results-test-v3.jsonl --questions test/questions.jsonl --out predictions.jsonl
 
-From run.py (imported, not copied where it can be): one Reactor history per dataset history, a rerun resumes the
-latest dataset history in its Reactor history without a reset, --timeout 600, and a timed-out question is listened
-for (--late-wait, listen.py) before it is asked once more in the same Reactor history; late answers that arrive in
-other questions' late_replies are recorded as "recovered" lines (make_predictions.recover_late()).
-From run_v3.py (run_v2.py with version 3): evidence(version=3), prompt_v2() and the evidence log's fields. Its two
-flags are on by default here, as the test run uses them: no missing-words hint (--hint puts it back) and the
-lenient abstain line (--strict leaves it out). tests/test_run_v3_test.py proves, with a fake client, that the
-question text and evidence sent are byte-identical to run_v3.py --no-hint --lenient.
-
-A new history restarts the agent, and a question sent before it is back up fails at once: "closed", "refused at
-connect (HTTP 403)" or "history_resetting" (on sample_hard, where nearly every question has its own dataset history,
-the first 10 failed this way within seconds, each failure bringing on the next reset). So after --new-history the
-driver waits --settle seconds (default 15; the kit has no readiness call to poll), and a question that fails that
-way before anything has been answered in its Reactor history is asked again in the same history, after 10, 20 and
-40 seconds (run.STARTUP_RETRIES), instead of moving on to another reset, as run.py does. Each failed attempt is
-still recorded.
+From run.py: one Reactor history per dataset history, --timeout 600, listening for a timed-out question's late
+answer before asking it once more in the same history, recovered late answers, resuming without a reset, and the
+wait and retries after --new-history (run.py's docstring).
+From run_v3.py: evidence(version=3), prompt_v2() and the evidence log's fields, with the submission's settings on by
+default: no missing-words hint (--hint puts it back) and the lenient abstain line (--strict leaves it out).
+tests/test_run_v3_test.py proves, with a fake client, that the question text and evidence sent are byte-identical to
+run_v3.py --no-hint --lenient.
 """
 from __future__ import annotations
 

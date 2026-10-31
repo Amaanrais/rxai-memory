@@ -11,23 +11,20 @@ appended to --out at once; a rerun skips the questions already answered there an
 refusals, errors). The excerpts sent and suggest_citations() for each question go to --evidence-log (default:
 <out>.evidence.jsonl), which make_predictions.py reads.
 
-The client waits --timeout seconds (default 600). A timeout doesn't cancel the question on Reactor's side, so for a
-question that times out the driver first sends nothing and listens on the same Reactor history for up to --late-wait
-seconds (default 120; listen.py) for its late answer, recorded as a "recovered" line. Only if none arrives is the
-question asked once more in the same Reactor history; the client retries while the previous request is pending.
-A rerun resumes without a reset: if the dataset history of the latest result line has an answered question, it
-carries on in that line's Reactor history (the agent's current one) and does it first; any other dataset history
-gets --new-history. If the agent's current history has changed meanwhile, that one starts afresh too. A timed-out
-question's answer that arrives later, in another question's late_replies, is recorded for it as an answered line
-marked "recovered" (make_predictions.recover_late()).
+Timeouts: the client waits --timeout seconds (default 600). A timeout doesn't cancel the question on Reactor's side,
+so the driver first sends nothing and listens on the same Reactor history for up to --late-wait seconds (default 120;
+listen.py). Only if no answer arrives is the question asked once more in the same history. A late answer that
+arrives in another question's late_replies is recorded as an answered line marked "recovered"
+(make_predictions.recover_late()).
 
-A new history restarts the agent, and a question sent before it is back up fails at once: "closed", "refused at
-connect (HTTP 403)" or "history_resetting" (on sample_hard, where nearly every question has its own dataset history,
-the first 10 failed this way within seconds, each failure bringing on the next reset). So after --new-history the
-driver logs its running/restarted fields and waits --settle seconds (default 15; the kit has no readiness call to
-poll), and a question that fails that way before anything has been answered in its Reactor history is asked again
-in the same history, after 10, 20 and 40 seconds (STARTUP_RETRIES), instead of moving on to another reset. Each
-failed attempt is still recorded; make_predictions.choose() keeps the answered line.
+Resuming: a rerun carries on in the Reactor history of the latest result line (the agent's current one) without a
+reset, and finishes that dataset history first; if the agent's history has changed meanwhile, it starts afresh.
+
+Startup: a new history restarts the agent, and a question sent before it is back up fails at once ("closed", HTTP
+403 or "history_resetting"). So after --new-history the driver waits --settle seconds (default 15; the kit has no
+readiness call), and a question that fails that way before anything is answered in its Reactor history is asked
+again in the same history after 10, 20 and 40 seconds (STARTUP_RETRIES). Every attempt is recorded;
+make_predictions.choose() keeps the answered line.
 """
 from __future__ import annotations
 

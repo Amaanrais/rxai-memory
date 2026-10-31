@@ -7,7 +7,7 @@
 
 Two pages: Chat (a chat-first start screen with suggestions, then the conversation; each reply opens its Sources
 and "How I answered" in a dialog) and About (for businesses, how it works, results). Answers come from the run
-files in the repo root: every results-*.jsonl with its <name>.evidence.jsonl, as written by run.py / run_v2.py.
+files in the repo root: every results-*.jsonl with its <name>.evidence.jsonl, as the drivers write them.
 Retrieval runs live for any question. Advanced settings sit in the collapsed sidebar.
 """
 from __future__ import annotations
@@ -53,7 +53,7 @@ CHIPS = [("What did I bake for my niece's party?", "q_4feb114c6944", False),
 PEOPLE = {"h_e6d0b8417122": "Alex", "h_805dae031df3": "Sam", "h_c2c3efa33e8e": "Priya", "h_2bbadf4a2bcd": "Jordan"}
 NAMES = ["Mateo", "Noor", "Lena", "Kofi", "Hana", "Ravi", "Zoe", "Elif", "Tomás", "Aiko", "Femi", "Ines"]
 
-# the mark: a speech bubble with a highlighter stroke, the browser tab's icon
+# the mark: a speech bubble with a highlighter stroke
 MARK_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="#0e5a5f"/>'
             '<path d="M11 13.5a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v8.5a3 3 0 0 1-3 3h-7.2l-4.6 3.8v-3.8H14a3 3 0 0 1-3-3z" '
             'fill="#fff"/><rect x="14.5" y="15.2" width="11" height="3.4" rx="1.2" fill="#ffe68a"/>'
@@ -67,10 +67,9 @@ st.set_page_config(page_title="Recall", page_icon=MARK_URL, layout="centered",
                    initial_sidebar_state="collapsed")
 
 # ---------- style ----------
-# The Apple design analysis (DESIGN.md): the system font stack, 17px body, weights 400 and 600, tight tracking on
-# display sizes, one accent for every action (our teal in place of Action Blue), no shadows on cards or buttons,
-# pills for actions and inputs, scale(0.97) on press, a frosted bar for what floats. The brief adds one very soft
-# teal gradient pooled at the bottom of the start screen. The highlighter marks cited text in Sources only.
+# The system font stack, 17px body, weights 400 and 600, one teal accent for every action, no shadows on cards or
+# buttons, pills for actions and inputs, a frosted bar for what floats, and a soft teal gradient at the bottom of the
+# start screen. The highlighter marks cited text in Sources only.
 st.html("""
 <style>
 :root {

@@ -53,7 +53,18 @@ CHIPS = [("What did I bake for my niece's party?", "q_4feb114c6944", False),
 PEOPLE = {"h_e6d0b8417122": "Alex", "h_805dae031df3": "Sam", "h_c2c3efa33e8e": "Priya", "h_2bbadf4a2bcd": "Jordan"}
 NAMES = ["Mateo", "Noor", "Lena", "Kofi", "Hana", "Ravi", "Zoe", "Elif", "Tomás", "Aiko", "Femi", "Ines"]
 
-st.set_page_config(page_title="Recall", page_icon="💬", layout="centered", initial_sidebar_state="collapsed")
+# the mark: a speech bubble with a highlighter stroke, the browser tab's icon
+MARK_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="#0e5a5f"/>'
+            '<path d="M11 13.5a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v8.5a3 3 0 0 1-3 3h-7.2l-4.6 3.8v-3.8H14a3 3 0 0 1-3-3z" '
+            'fill="#fff"/><rect x="14.5" y="15.2" width="11" height="3.4" rx="1.2" fill="#ffe68a"/>'
+            '<rect x="14.5" y="19.6" width="7" height="1.6" rx="0.8" fill="#9fb9ba"/></svg>')
+# the browser tab's icon
+MARK_URL = "data:image/svg+xml;base64," + __import__("base64").b64encode(MARK_SVG.encode()).decode()
+# the wordmark: "Recall" in ink with a teal full stop
+WORDMARK = 'Recall<span class="dot">.</span>'
+
+st.set_page_config(page_title="Recall", page_icon=MARK_URL, layout="centered",
+                   initial_sidebar_state="collapsed")
 
 # ---------- style ----------
 # The Apple design analysis (DESIGN.md): the system font stack, 17px body, weights 400 and 600, tight tracking on
@@ -84,11 +95,21 @@ html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]):not(.material-s
 *:focus-visible { outline: 2px solid var(--accent-ring) !important; outline-offset: 2px; }
 p, li { font-size: 17px; line-height: 1.47; }
 
+/* the wordmark: small and fixed in the top-left corner on every screen, large over the start screen's title */
+.st-key-brand { position: fixed; top: 17px; left: 22px; width: auto; z-index: 1000001; }
+[data-testid="stToolbar"] > div:first-child { padding-left: 82px; }  /* the sidebar arrow and pages after it */
+.wordmark { font-size: 20px; line-height: 1; font-weight: 700; letter-spacing: -0.02em; color: var(--ink); }
+.wordmark .dot { color: var(--accent); }
+.hero .wordmark { font-size: 40px; letter-spacing: -0.03em; }
+.about-head { margin: 0 0 8px; }
+.about-head .wordmark { font-size: 40px; letter-spacing: -0.03em; }
+.about-head .line { font-size: 21px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; color: var(--muted);
+  margin-top: 6px; }
+
 /* the start screen */
 .hero { display: flex; flex-direction: column; align-items: center; text-align: center; padding-top: 14vh; }
-.hero img { width: 44px; height: 44px; }
 .hero h1 { font-size: 30px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; color: var(--ink);
-  margin: 18px 0 0; padding: 0; text-wrap: balance; }
+  margin: 14px 0 0; padding: 0; text-wrap: balance; }
 .st-key-who { margin-top: -6px; }
 .st-key-who button p, .st-key-whochat button p { font-size: 15px; color: var(--muted); }
 .st-key-who button:hover p, .st-key-whochat button:hover p { color: var(--accent); }
@@ -213,15 +234,6 @@ table.t tr.all td { font-weight: 600; }
 }
 </style>
 """)
-
-# the mark: a speech bubble with a highlighter stroke, the app's one memorable element
-MARK_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="#0e5a5f"/>'
-            '<path d="M11 13.5a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v8.5a3 3 0 0 1-3 3h-7.2l-4.6 3.8v-3.8H14a3 3 0 0 1-3-3z" '
-            'fill="#fff"/><rect x="14.5" y="15.2" width="11" height="3.4" rx="1.2" fill="#ffe68a"/>'
-            '<rect x="14.5" y="19.6" width="7" height="1.6" rx="0.8" fill="#9fb9ba"/></svg>')
-# st.html drops inline SVG, so the mark travels as an image
-MARK = ('<img alt="Recall" src="data:image/svg+xml;base64,'
-        + __import__("base64").b64encode(MARK_SVG.encode()).decode() + '">')
 
 # ---------- data ----------
 
@@ -683,7 +695,8 @@ def chat_page() -> None:
             with st.container(key="chips"):
                 for col, (text, qid, v2) in zip(st.columns(len(chips)), chips):
                     col.button(text, key=f"chip-{qid}", width="stretch", on_click=ask_chip, args=(text, qid, v2))
-        st.html(f'<div class="hero">{MARK}<h1>Ask about anything you\'ve told me.</h1></div>')
+        st.html(f'<div class="hero"><div class="wordmark">{WORDMARK}</div>'
+                '<h1>Ask about anything you\'ve told me.</h1></div>')
         with st.container(key="who", horizontal=True, horizontal_alignment="center"):
             if st.button(who_line, type="tertiary", help="Switch to another user's chat history"):
                 switch_dialog()
@@ -734,6 +747,8 @@ def sources_cited_share() -> tuple[int, int]:
 
 
 def about_page() -> None:
+    st.html(f'<div class="about-head"><div class="wordmark">{WORDMARK}</div>'
+            '<div class="line">A memory layer for AI assistants.</div></div>')
     business, how, results = st.tabs(["For businesses", "How it works", "Results"])
     with business:
         named, total = sources_cited_share()
@@ -827,5 +842,7 @@ passages, so Reactor says it doesn't know instead of guessing.</li>
         st.html("".join(out) or '<div class="sources-intro">No results saved yet.</div>')
 
 
+with st.container(key="brand"):
+    st.html(f'<div class="wordmark">{WORDMARK}</div>')
 st.navigation([st.Page(chat_page, title="Chat", default=True),
                st.Page(about_page, title="About", url_path="about")], position="top").run()

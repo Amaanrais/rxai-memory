@@ -103,4 +103,4 @@ streamlit run app.py --server.address localhost           # the demo app (never 
 
 ## Team
 
-Amaan Rais Shah, Dedar Alam, Frensi. Built with Claude Code as a coding assistant.
+Amaan Rais Shah, Dedar Alam, Frensi.

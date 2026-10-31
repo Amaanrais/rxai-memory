@@ -112,9 +112,9 @@ const slides = [
   `<h2><small>Results by question type</small>Retrieval on dev, the version used on test</h2>${pairSvg(D.byType, D.byTypeNames)}
    <p class="note">${esc(D.byTypeNote)}</p>`,
   `<h2><small>Results</small>Where we stand</h2>${barsSvg(D.results)}<p class="note">${esc(D.resultsNote)}</p>`,
-  `<h2><small>v2</small>Built and measured, ready for the next run</h2>${cards(D.v2)}
-   ${pairSvg(D.ablation.map(r => ({ label: r.label, a: r.before, b: r.after })), ["v1", "v2"], 0.7)}
-   <p class="note">Answer in the evidence sent, v1 → v2. ${esc(D.v2Note)}</p>`,
+  `<h2><small>v2 → v3</small>What the submission adds</h2>${cards(D.v2)}
+   ${pairSvg(D.ablation.map(r => ({ label: r.label, a: r.before, b: r.after })), ["v2", "v3"], 1)}
+   <p class="note">Answer in the evidence sent, v2 → v3. ${esc(D.v2Note)}</p>`,
   `<h2><small>Playing by the rules</small>Every answer is Reactor's</h2>${cards(D.rules)}`,
   `<h2><small>Run it</small>Reproduce, then see it live</h2><pre>${D.run.map(esc).join("\n")}</pre>`,
   `<h2><small>Next</small>What's next</h2>${steps(D.next)}`,

@@ -1,7 +1,8 @@
 """Builds recall.mp4: the deck and the Recall app, screen-recorded, with a neural voiceover.
 
     streamlit run app.py --server.address localhost --server.port 8501     # in another terminal
-    uv run --with playwright python presentation/video/make_video.py
+    uv run --with playwright --with pillow python presentation/video/make_video.py
+    uv run --with playwright --with pillow python presentation/video/make_video.py --burn   # only redo recall-captioned.mp4
 
 Needs ffmpeg and uv on PATH (edge-tts, run through uvx, sends the narration text to Microsoft's TTS service).
 Edit SEGMENTS to change what is said or shown; every run rebuilds everything from scratch.
@@ -9,7 +10,9 @@ Edit SEGMENTS to change what is said or shown; every run rebuilds everything fro
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,10 +22,14 @@ HERE = Path(__file__).resolve().parent
 DECK = (HERE.parent / "index.html").as_uri()
 APP = "http://localhost:8501"
 OUT = HERE / "recall.mp4"
+SRT = HERE / "recall.srt"  # the narration as captions: a sidecar file and a subtitle track in OUT
+BURNED = HERE / "recall-captioned.mp4"  # OUT with the captions drawn into the picture
+FONT = "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
 WORK = HERE / "build"
 VOICE, RATE = "en-US-AndrewMultilingualNeural", "+4%"
 SIZE = {"width": 1920, "height": 1080}
 GAP = 0.7  # seconds of quiet after each line
+DEMO_QUESTION = "What did I bake for my niece's party?"  # one of the app's suggestions
 
 # (what to show, narration). ("slide", n) is deck slide n; ("app", action) is a step in the Recall app.
 SEGMENTS = [
@@ -42,30 +49,31 @@ SEGMENTS = [
     (("slide", 6), "Citations follow the organisers' rule: they must support the answer. Reactor's own labels come "
                    "first, then excerpts that actually contain its answer, and never the top result by default. When "
                    "Reactor says the evidence is insufficient, we abstain, with no citations."),
-    (("app", "open"), "This is our demo app. We pick a question: what did I bake for my niece's birthday party? "
-                      "Recall searches this user's whole chat history, and reads about forty times less than all of "
-                      "it."),
-    (("app", "sources"), "Under Sources is exactly what Reactor would receive: a few dated excerpts, each saying how "
-                         "many days before the question it happened."),
-    (("app", "update"), "For a fact that changed, like a frequent flyer status, the latest excerpt is marked most "
-                        "recent, so the newest value wins, unless the question asks for the previous one."),
-    (("app", "results"), "And the Results tab shows our measured retrieval numbers, straight from the evaluation "
-                         "files."),
-    (("slide", 7), "That focus pays off. We send a median of eight point two thousand characters per question: about "
-                   "two hundred times less than the full history, and nineteen to twenty-three times less per user "
-                   "than loading the whole history into Reactor."),
+    (("app", "open"), "This is our demo app. You chat with your own history. We ask: what did I bake for my niece's "
+                      "party? Recall searches forty-eight past conversations, and Reactor answers: lemon blueberry "
+                      "cake, from our chat on the twenty-sixth of May."),
+    (("app", "sources"), "Sources shows exactly what Reactor was given: a few excerpts, oldest first, each with its date "
+                         "and how many days before the question it was said. The newest is marked most recent, so a "
+                         "value that changed takes its latest form."),
+    (("app", "results"), "The About page explains how it works, and its Results tab shows our measured numbers, "
+                         "straight from the evaluation files."),
+    (("slide", 7), "That focus pays off. Our submitted run sends a median of eleven point three thousand characters "
+                   "per question: a hundred and forty-seven times less than the full history, and fifteen times less "
+                   "per user than loading the whole history into Reactor."),
     (("slide", 8), "By question type, a correct conversation is in our top five for over ninety-five percent of "
                    "questions in every type. The hard part is multi-session and temporal questions, where the answer "
                    "is spread over several turns."),
     (("slide", 9), "Overall, a correct conversation is in the top five for ninety-eight point two percent of dev "
-                   "questions, and ninety-three point five percent on dev-large, with five hundred conversations per "
-                   "user. Test scores come from the organisers."),
-    (("slide", 10), "We also built and measured version two: focused trimming, more room for a clear leader, time "
-                    "sentences, and a missing-words hint against traps. It's ready for the next run."),
+                   "questions, and ninety-three point five percent on dev-large. On the test set, our submitted run "
+                   "answered a hundred and twenty-three of a hundred and forty-six questions, each with its sources. "
+                   "Accuracy comes from the organisers."),
+    (("slide", 10), "Our submission is version three. Version two sharpens the evidence. Version three adds name "
+                    "questions: synonyms, and a boost for a name near the thing asked about. And a lenient abstain "
+                    "line cut our test abstentions from twenty-one to sixteen percent."),
     (("slide", 11), "And we played by the rules: every answer comes from Reactor, one Reactor history per user, "
                     "careful timeout handling, and evidence logs that make every prediction reproducible."),
     (("slide", 13), "Next: a local reranker for questions worded differently from the chat, dates computed in code, "
-                    "and smarter abstention."),
+                    "and checking that the lenient line doesn't let trick questions through."),
     (("slide", 14), "Thank you. That's Recall: the needle, not the haystack."),
 ]
 
@@ -88,6 +96,61 @@ def voice() -> list[float]:
     return lengths
 
 
+def stamp(seconds: float) -> str:
+    ms = round(seconds * 1000)
+    return f"{ms // 3_600_000:02}:{ms // 60_000 % 60:02}:{ms // 1000 % 60:02},{ms % 1000:03}"
+
+
+def captions(lengths: list[float], width: int = 84) -> None:
+    """Writes SRT: each line split at sentence or clause ends into captions of at most ``width`` characters,
+    timed by their share of the line's characters."""
+    cues, start = [], 0.0
+    for (_, text), length in zip(SEGMENTS, lengths):
+        parts, current = [], ""
+        for word in text.split():
+            if current and len(current) + 1 + len(word) > width:
+                parts.append(current)
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+            if current.endswith((".", "?", ":")) and len(current) > width // 2:
+                parts.append(current)
+                current = ""
+        parts += [current] if current else []
+        speech, at = length - GAP, start
+        for part in parts:
+            end = at + speech * len(part) / sum(map(len, parts))
+            cues.append((at, end, part))
+            at = end
+        start += length
+    SRT.write_text("".join(f"{i}\n{stamp(a)} --> {stamp(b)}\n{s}\n\n" for i, (a, b, s) in enumerate(cues, 1)))
+
+
+def burn() -> None:
+    """BURNED: OUT with each SRT caption drawn as an image (Pillow) overlaid at the bottom, for players that ignore
+    subtitle tracks. Overlays, not ffmpeg's subtitles filter, which needs an ffmpeg built with libass."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(FONT, 38)
+    cues = re.findall(r"\d+\n(\S+) --> (\S+)\n(.+?)\n\n", SRT.read_text(), re.DOTALL)
+    secs = lambda s: sum(float(x) * m for x, m in zip(s.replace(",", ".").split(":"), (3600, 60, 1)))
+    inputs, chain, last = [], [], "0:v"
+    for i, (a, b, text) in enumerate(cues):
+        box = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), text, font=font)
+        w, h = box[2] - box[0] + 48, box[3] - box[1] + 28
+        img = Image.new("RGBA", (w, h))
+        ImageDraw.Draw(img).rounded_rectangle((0, 0, w - 1, h - 1), 12, fill=(0, 0, 0, 170))
+        ImageDraw.Draw(img).text((24 - box[0], 14 - box[1]), text, font=font, fill="white")
+        png = WORK / f"cc{i:03}.png"
+        img.save(png)
+        inputs += ["-i", str(png)]
+        out = f"v{i}"
+        chain.append(f"[{last}][{i + 1}:v]overlay=(W-w)/2:H-h-36:enable='between(t,{secs(a):.3f},{secs(b):.3f})'[{out}]")
+        last = out
+    run("ffmpeg", "-y", "-i", str(OUT), *inputs, "-filter_complex", ";".join(chain), "-map", f"[{last}]",
+        "-map", "0:a", "-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-movflags", "+faststart", str(BURNED))
+
+
 def scroll(page, steps: int, dy: int, pause: int = 700) -> None:
     for _ in range(steps):
         page.mouse.wheel(0, dy)
@@ -95,21 +158,18 @@ def scroll(page, steps: int, dy: int, pause: int = 700) -> None:
 
 
 def app_step(page, action: str) -> None:
-    page.mouse.move(640, 420)  # wheel events go to what's under the pointer: the main column
     if action == "open":
-        page.get_by_role("button", name="A fact the user mentioned").click()
+        page.get_by_role("button", name=DEMO_QUESTION).click()
     elif action == "sources":
-        page.get_by_role("tab", name="Sources").click()
-        scroll(page, 6, 260)
-    elif action == "update":
-        scroll(page, 1, -6000, 400)
-        page.get_by_role("button", name="A fact that changed").click()
-        page.wait_for_timeout(2500)
-        scroll(page, 5, 240)
+        page.get_by_role("button", name="Sources").first.click()
     elif action == "results":
-        scroll(page, 1, -6000, 400)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(800)
+        page.get_by_role("link", name="About").click()
+        page.wait_for_timeout(2500)
         page.get_by_role("tab", name="Results").click()
         page.wait_for_timeout(1500)
+        page.mouse.move(640, 420)  # wheel events go to what's under the pointer: the main column
         scroll(page, 4, 300, 900)
 
 
@@ -130,7 +190,7 @@ def record(blocks: list[list[int]], lengths: list[float]) -> list[Path]:
                 page.evaluate(f"go({SEGMENTS[block[0]][0][1] - 1})")
             else:
                 page.goto(APP)
-                page.get_by_role("button", name="A fact the user mentioned").wait_for(timeout=120_000)
+                page.get_by_role("button", name=DEMO_QUESTION).wait_for(timeout=120_000)
             page.wait_for_timeout(1500)  # let the first view settle
             start = due = time.monotonic()
             for i in block:
@@ -172,11 +232,14 @@ def main() -> None:
     run("ffmpeg", "-y", *inputs, "-filter_complex", f"{pads}{joined}concat=n={n}:v=0:a=1[a]",
         "-map", "[a]", str(WORK / "voice.wav"))
     total = sum(lengths)
-    run("ffmpeg", "-y", "-i", str(WORK / "video.mp4"), "-i", str(WORK / "voice.wav"),
+    captions(lengths)
+    run("ffmpeg", "-y", "-i", str(WORK / "video.mp4"), "-i", str(WORK / "voice.wav"), "-i", str(SRT),
+        "-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:s", "mov_text", "-metadata:s:s:0", "language=eng",
         "-vf", f"fade=in:0:15,fade=out:st={total - 0.6:.3f}:d=0.6", "-c:v", "libx264", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(OUT))
-    print(json.dumps({"out": str(OUT), "seconds": round(total, 1), "segments": n}))
+    burn()
+    print(json.dumps({"out": str(OUT), "captioned": str(BURNED), "seconds": round(total, 1), "segments": n}))
 
 
 if __name__ == "__main__":
-    main()
+    burn() if "--burn" in sys.argv[1:] else main()

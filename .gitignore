@@ -9,4 +9,6 @@ __pycache__/
 .env
 .venv/
 .taste-skill/
+presentation/video/build/
+presentation/video/*.mp4
 *.partial

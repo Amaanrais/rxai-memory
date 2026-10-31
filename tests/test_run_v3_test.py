@@ -44,6 +44,8 @@ def sent(log: Path) -> list[dict]:
 def run(script: str, questions: Path, histories: Path, out: Path, *flags: str, timeout_once: str = "") -> Path:
     log = out.with_suffix(".calls.jsonl")
     env = {**os.environ, "REACTOR_ACCESS_KEY": "fake", "FAKE_CLIENT_LOG": str(log), "FAKE_TIMEOUT_ONCE": timeout_once}
+    if script == "run_v3_test.py":
+        flags = (*flags, "--settle", "0")  # no waiting for a fake agent
     subprocess.run([sys.executable, str(ROOT / script), "--questions", str(questions), "--histories", str(histories),
                     *BASE, "--out", str(out), *flags], env=env, check=True, capture_output=True, cwd=ROOT)
     return log
@@ -87,6 +89,46 @@ class SameAsRunV3(unittest.TestCase):
         self.assertEqual(n, 40)
         self.assertEqual(problems, [])
 
+    def drive(self, n: int, env: dict) -> tuple[int, list[float], list[list[str]], list[dict]]:
+        """run_v3_test.main() in-process on the first ``n`` dev questions with the fake client: (exit code, pauses,
+        client calls' arguments, result lines)."""
+        questions = first_questions(n, DEV / "questions.jsonl")
+        pauses: list[float] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log = Path(tmp) / "r.jsonl", Path(tmp) / "calls.jsonl"
+            env = {"REACTOR_ACCESS_KEY": "fake", "FAKE_CLIENT_LOG": str(log), **env}
+            with mock.patch.dict(os.environ, env), mock.patch.object(run_v3_test, "pause", pauses.append), \
+                    mock.patch.object(run_v3_test, "wait_for_late", lambda *a: []):
+                code = run_v3_test.main(["--questions", str(questions), "--histories", str(DEV / "histories.jsonl"),
+                                         *BASE, "--out", str(out)])
+            questions.unlink()
+            calls = [json.loads(line)["argv"] for line in log.read_text(encoding="utf-8").splitlines()]
+            lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+        return code, pauses, calls, lines
+
+    def test_waits_after_new_history_and_retries_startup_failures_in_the_same_history(self):
+        code, pauses, calls, lines = self.drive(3, {"FAKE_STARTUP_FAILS": "closed,403,resetting"})
+        self.assertEqual(code, 0)
+        new = [c for c in calls if "--new-history" in c]
+        asks = [c for c in calls if "--new-history" not in c]
+        histories = {json.loads(q)["history_id"] for q in
+                     (DEV / "questions.jsonl").read_text(encoding="utf-8").splitlines()[:3]}
+        self.assertEqual(len(new), len(histories))  # no extra resets
+        first = asks[0][asks[0].index("--question-id") + 1]
+        first_asks = [c for c in asks if c[c.index("--question-id") + 1] == first]
+        self.assertEqual(len(first_asks), 4)  # three startup failures, then the answer
+        self.assertEqual(len({c[c.index("--history") + 1] for c in first_asks}), 1)  # all in one history
+        self.assertEqual(pauses[:4], [15.0, 10, 20, 40])  # settle, then the backoff
+        self.assertEqual([r["status"] for r in lines[:4]], ["closed", "error", "refused", "answered"])
+        answered = {r["question_id"] for r in lines if r["status"] == "answered"}
+        self.assertEqual(len(answered), 3)
+
+    def test_gives_up_on_a_question_after_three_startup_retries(self):
+        code, pauses, calls, lines = self.drive(1, {"FAKE_STARTUP_FAILS": "closed,closed,closed,closed,closed"})
+        self.assertEqual(code, 0)
+        self.assertEqual(pauses, [15.0, 10, 20, 40])
+        self.assertEqual([r["status"] for r in lines], ["closed"] * 4)
+
     def test_timeout_listens_then_asks_again_in_the_same_history(self):
         questions = first_questions(3, DEV / "questions.jsonl")
         first = json.loads(questions.read_text(encoding="utf-8").splitlines()[0])["question_id"]
@@ -97,7 +139,7 @@ class SameAsRunV3(unittest.TestCase):
             with mock.patch.dict(os.environ, env), mock.patch.object(
                     run_v3_test, "wait_for_late", lambda *a: heard.append(a) or []):
                 code = run_v3_test.main(["--questions", str(questions), "--histories", str(DEV / "histories.jsonl"),
-                                         *BASE, "--out", str(out)])
+                                         *BASE, "--out", str(out), "--settle", "0"])
             questions.unlink()
             self.assertEqual(code, 0)
             self.assertEqual(len(heard), 1)  # listened once, on the history the question timed out in

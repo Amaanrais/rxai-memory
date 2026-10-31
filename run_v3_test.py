@@ -12,6 +12,13 @@ From run_v3.py (run_v2.py with version 3): evidence(version=3), prompt_v2() and 
 flags are on by default here, as the test run uses them: no missing-words hint (--hint puts it back) and the
 lenient abstain line (--strict leaves it out). tests/test_run_v3_test.py proves, with a fake client, that the
 question text and evidence sent are byte-identical to run_v3.py --no-hint --lenient.
+
+A new history restarts the agent, and a question sent before it is back up fails at once: "closed", "refused at
+connect (HTTP 403)" or "history_resetting" (on sample_hard, where nearly every question has its own dataset history,
+the first 10 failed this way within seconds, each failure bringing on the next reset). So after --new-history the
+driver waits --settle seconds (default 15; the kit has no readiness call to poll), and a question that fails that
+way before anything has been answered in its Reactor history is asked again in the same history, after 10, 20 and
+40 seconds (STARTUP_RETRIES), instead of moving on to another reset. Each failed attempt is still recorded.
 """
 from __future__ import annotations
 
@@ -33,6 +40,19 @@ from run import MAX_CHARS, ROOT, ROUTED_MAX_CHARS, client, clock, resume_point
 from run_v2 import HINT_WORDS, prompt_v2
 
 VERSION = 3
+STARTUP_RETRIES = (10, 20, 40)  # seconds before each new attempt at a question the restarting agent dropped
+
+
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def startup_failure(result: dict) -> bool:
+    """A failure that means the agent wasn't up yet: the chat closed, the connection refused (HTTP 403, "the agent
+    isn't running"), or the new history still starting."""
+    return (result.get("status") == "closed"
+            or (result.get("status") == "error" and "HTTP 403" in str(result.get("error")))
+            or (result.get("status") == "refused" and result.get("code") == "history_resetting"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--client", type=Path, default=ROOT / "reactor" / "client.py")
     parser.add_argument("--hint", action="store_true", help="add the missing-words hint (run_v3.py's default)")
     parser.add_argument("--strict", action="store_true", help="leave out the lenient abstain line")
+    parser.add_argument("--settle", type=float, default=15.0,
+                        help="seconds to wait after --new-history for the agent to come up (default 15)")
     args = parser.parse_args(argv)
     evidence_log = args.evidence_log or args.out.with_suffix(".evidence.jsonl")
     if not os.environ.get("REACTOR_ACCESS_KEY"):
@@ -131,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_chars = ROUTED_MAX_CHARS if route(q["question"], VERSION)[1] > 12000 else MAX_CHARS
                 started = time.monotonic()
                 retried = fresh = False
+                startup = iter(STARTUP_RETRIES)
                 while True:
                     if reactor_history is None:
                         new = client(args, "--new-history", *timeout)  # one Reactor history per dataset history
@@ -138,6 +161,11 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"--new-history failed: {new.get('error') or new}", file=sys.stderr)
                             return 2
                         reactor_history = new["history_id"]
+                        if args.settle > 0:
+                            print(f"  new Reactor history {reactor_history} (running: {new.get('running')}, "
+                                  f"restarted: {new.get('restarted')}); waiting {args.settle:g}s for the agent",
+                                  file=sys.stderr)
+                            pause(args.settle)
                     extra = ["--history", reactor_history, "--question", question,
                              "--question-date", q["question_date"], "--question-id", q["question_id"],
                              "--max-chars", str(max_chars), *timeout]
@@ -153,6 +181,15 @@ def main(argv: list[str] | None = None) -> int:
                         reactor_history, fresh = None, True
                         continue
                     record(result)
+                    if startup_failure(result) and not any(
+                            r.get("status") == "answered" and r.get("history_id") == reactor_history for r in lines):
+                        wait = next(startup, None)
+                        if wait is not None:
+                            print(f"  {q['question_id']}: {result.get('status')} "
+                                  f"({result.get('code') or result.get('error') or 'chat closed'}) before the agent "
+                                  f"was up; asking again in the same Reactor history in {wait}s", file=sys.stderr)
+                            pause(wait)
+                            continue
                     if result.get("status") == "timeout" and not retried:
                         retried = True
                         print(f"  {q['question_id']}: timeout after {time.monotonic() - started:.0f}s; listening up "

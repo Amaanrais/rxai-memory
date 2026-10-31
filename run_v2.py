@@ -12,6 +12,7 @@ Changes from run.py:
   "single value only";
 - the missing-words hint: the question's rarer content words that appear nowhere in the evidence (at most
   HINT_WORDS), named in the question so that the agent abstains on a near miss. The evidence log records them.
+  --no-hint leaves the hint out of the question (the words are still computed and logged, with "hint": false).
 Everything else (one HistoryIndex and --new-history per dataset history, the other instructions, --max-chars,
 results appended at once, answered questions skipped on rerun, latency/ETA) is run.py's.
 """
@@ -64,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-log", type=Path, help="default: <out>.evidence.jsonl, appended to")
     parser.add_argument("--timeout", help="passed to client.py (seconds)")
     parser.add_argument("--client", type=Path, default=ROOT / "reactor" / "client.py")
+    parser.add_argument("--no-hint", action="store_true", help="leave the missing-words hint out of the question")
     args = parser.parse_args(argv)
     evidence_log = args.evidence_log or args.out.with_suffix(".evidence.jsonl")
     if not os.environ.get("REACTOR_ACCESS_KEY"):
@@ -99,12 +101,13 @@ def main(argv: list[str] | None = None) -> int:
                 missing = index.missing_words(q["question"], evidence, limit=HINT_WORDS)
                 log.write(json.dumps({"question_id": q["question_id"], "history_id": q["history_id"],
                                       "version": VERSION, "evidence": evidence, "suggested": suggested,
-                                      "missing": missing}, ensure_ascii=False) + "\n")
+                                      "missing": missing, "hint": not args.no_hint}, ensure_ascii=False) + "\n")
                 log.flush()
                 path = Path(tmp) / "evidence.json"
                 path.write_text(json.dumps(evidence), encoding="utf-8")
                 max_chars = ROUTED_MAX_CHARS if is_aggregate(q["question"]) else MAX_CHARS
-                extra = ["--history", new["history_id"], "--question", prompt_v2(q["question"], missing),
+                question = prompt_v2(q["question"], [] if args.no_hint else missing)
+                extra = ["--history", new["history_id"], "--question", question,
                          "--question-date", q["question_date"], "--question-id", q["question_id"],
                          "--max-chars", str(max_chars), *timeout]
                 if evidence:

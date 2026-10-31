@@ -14,6 +14,10 @@ excerpt. A question abstains, with no citations, when the agent said INSUFFICIEN
 "answered", or when it has no result line. When a question has several result lines, an answered one wins, then
 the latest. A timed-out question whose answer arrived later, in another line's late_replies (Reactor's own answer
 to its ref), counts as answered with that answer (``recover_late()``; run.py also records such lines).
+
+One line per question (``choose()``): among its answered lines, the original question's late answer wins over a
+retry's, and between equally valid lines the earlier one; with no answered line, the latest. The output never
+repeats a question_id.
 """
 from __future__ import annotations
 
@@ -71,21 +75,46 @@ def recovered(timed_out: dict, late: dict, received_in: dict) -> dict:
             "recovered": {"from_question_id": received_in.get("question_id"), "cycle": late.get("cycle")}}
 
 
-def recover_late(lines: list[dict]) -> list[dict]:
-    """Recovered lines (``recovered()``) for timed-out questions with no answered line whose answer arrived in a
-    later line's ``late_replies``, matched by the timed-out request's ref."""
+def recover_late(lines: list[dict], answered_too: bool = False) -> list[dict]:
+    """Recovered lines (``recovered()``) for timed-out questions whose answer arrived in a later line's
+    ``late_replies``, matched by the timed-out request's ref: one per ref not recovered yet, and only for questions
+    with no answered line unless ``answered_too`` (a retry may have been answered before the original's answer
+    came)."""
     answered = {r.get("question_id") for r in lines if r.get("status") == "answered"}
+    done = {r.get("ref") for r in lines if r.get("recovered")}
     timed_out: dict[str, dict] = {}  # ref -> the timed-out line, from earlier lines only
     out = []
     for r in lines:
         for late in r.get("late_replies") or []:
             line = timed_out.get(late.get("ref"))
-            if line and line["question_id"] not in answered:
+            if line and late["ref"] not in done and (answered_too or line["question_id"] not in answered):
                 out.append(recovered(line, late, r))
                 answered.add(line["question_id"])
+                done.add(late["ref"])
         if r.get("status") == "timeout" and r.get("ref") and r.get("question_id"):
             timed_out[r["ref"]] = r
     return out
+
+
+def choose(lines: list[dict]) -> dict[str, dict]:
+    """One result line per question_id from a results file's lines: among answered ones, a recovered late answer to
+    the original question first (the earliest timed-out request's), then the earliest; without any, the latest."""
+    asked_at: dict[str, int] = {}  # ref -> the line of the request that carried it (a recovered line repeats it)
+    for i, r in enumerate(lines):
+        if r.get("ref") and not r.get("recovered"):
+            asked_at.setdefault(r["ref"], i)
+    candidates: dict[str, list[tuple[tuple[int, int], dict]]] = {}
+    for i, r in enumerate(lines + recover_late(lines, answered_too=True)):
+        qid = r.get("question_id")
+        if not qid:
+            continue
+        if r.get("status") == "answered":
+            # recovered: ranked by when its original request was asked; otherwise by its own position
+            rank = (0, asked_at.get(r.get("ref"), i)) if r.get("recovered") else (1, i)
+        else:
+            rank = (2, -i)  # no answer: the latest line tells what happened
+        candidates.setdefault(qid, []).append((rank, r))
+    return {qid: min(c, key=lambda c: c[0])[1] for qid, c in candidates.items()}
 
 
 def excerpt_words(text: str) -> str:
@@ -144,12 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     log_path = args.evidence_log or args.results.with_suffix(".evidence.jsonl")
 
     question_ids = [q["question_id"] for q in read_jsonl(args.questions)]
-    lines = read_jsonl(args.results)
-    results: dict[str, dict] = {}
-    for r in lines + recover_late(lines):
-        qid = r.get("question_id")
-        if qid and (r.get("status") == "answered" or results.get(qid, {}).get("status") != "answered"):
-            results[qid] = r
+    results = choose(read_jsonl(args.results))
     logged = {e["question_id"]: e for e in read_jsonl(log_path)} if log_path.exists() else {}
     if not logged:
         print(f"warning: no evidence log at {log_path}: labels map through the client's citations only",

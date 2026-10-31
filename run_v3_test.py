@@ -18,7 +18,8 @@ connect (HTTP 403)" or "history_resetting" (on sample_hard, where nearly every q
 the first 10 failed this way within seconds, each failure bringing on the next reset). So after --new-history the
 driver waits --settle seconds (default 15; the kit has no readiness call to poll), and a question that fails that
 way before anything has been answered in its Reactor history is asked again in the same history, after 10, 20 and
-40 seconds (STARTUP_RETRIES), instead of moving on to another reset. Each failed attempt is still recorded.
+40 seconds (run.STARTUP_RETRIES), instead of moving on to another reset, as run.py does. Each failed attempt is
+still recorded.
 """
 from __future__ import annotations
 
@@ -36,23 +37,11 @@ from eval_retrieval import read_jsonl, stream_histories
 from listen import wait_for_late
 from make_predictions import recover_late
 from retrieval import HistoryIndex, route
-from run import MAX_CHARS, ROOT, ROUTED_MAX_CHARS, client, clock, resume_point
+from run import (MAX_CHARS, ROOT, ROUTED_MAX_CHARS, STARTUP_RETRIES, client, clock, pause, resume_point,
+                 startup_failure)
 from run_v2 import HINT_WORDS, prompt_v2
 
 VERSION = 3
-STARTUP_RETRIES = (10, 20, 40)  # seconds before each new attempt at a question the restarting agent dropped
-
-
-def pause(seconds: float) -> None:
-    time.sleep(seconds)
-
-
-def startup_failure(result: dict) -> bool:
-    """A failure that means the agent wasn't up yet: the chat closed, the connection refused (HTTP 403, "the agent
-    isn't running"), or the new history still starting."""
-    return (result.get("status") == "closed"
-            or (result.get("status") == "error" and "HTTP 403" in str(result.get("error")))
-            or (result.get("status") == "refused" and result.get("code") == "history_resetting"))
 
 
 def main(argv: list[str] | None = None) -> int:

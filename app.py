@@ -1,12 +1,13 @@
-"""Recall: grounded long-term memory for AI assistants and support teams. A Streamlit demo of our solution.
+"""Recall: find answers in months of chat history, with sources. A Streamlit demo of our solution.
 
-    streamlit run app.py                     # cached Reactor answers only: never calls Reactor
-    REACTOR_LIVE=1 streamlit run app.py      # adds an "Ask Reactor" button (REACTOR_BASE_URL, REACTOR_AGENT_ID,
-                                             # REACTOR_ACCESS_KEY from the environment; the key is never shown)
+    streamlit run app.py --server.address localhost          # saved Reactor answers only: never calls Reactor
+    REACTOR_LIVE=1 streamlit run app.py --server.address localhost
+        # adds an "Ask Reactor" button (REACTOR_BASE_URL, REACTOR_AGENT_ID, REACTOR_ACCESS_KEY from the environment;
+        # the key is never shown)
 
 Answers come from the run files in the repo root: every results-*.jsonl with its <name>.evidence.jsonl, as written
-by run.py / run_v2.py. Retrieval runs live for any question, cached or not. The Results tab reads metrics/*.json
-(eval_retrieval.py --json) and scores the cached dev runs with score.py.
+by run.py / run_v2.py. Retrieval runs live for any question, answered or not. The Results tab reads metrics/*.json
+(eval_retrieval.py --json) and scores the saved dev runs with score.py.
 """
 from __future__ import annotations
 
@@ -19,11 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import pandas as pd
 import streamlit as st
 
-from make_predictions import predict
-from retrieval import HistoryIndex, is_aggregate
+from make_predictions import choose, predict
+from retrieval import STOPWORDS, HistoryIndex, is_aggregate, stem, tokenize
 from score import score_question, summarize
 
 ROOT = Path(__file__).resolve().parent
@@ -32,39 +32,154 @@ LIVE = os.environ.get("REACTOR_LIVE") == "1"
 LIVE_ENV = ("REACTOR_BASE_URL", "REACTOR_AGENT_ID", "REACTOR_ACCESS_KEY")
 HISTORY_ID = re.compile(rb'\s*\{\s*"history_id"\s*:\s*"([^"]+)"')
 NOTE_DAYS = re.compile(r"^\((\d+) days? before the question date\)$")
-ROLE = re.compile(r"^(user \(elsewhere in this chat\)|user|assistant): ", re.MULTILINE)
+TURN = re.compile(r"^(user \(elsewhere in this chat\)|user|assistant): ", re.MULTILINE)
+WORD = re.compile(r"[A-Za-z0-9]+")
+SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 
-st.set_page_config(page_title="Recall", page_icon="🧠", layout="wide")
-st.markdown("""
+# the four questions of the "Try these" row: dev questions with a saved answer, one per kind of question
+DEMOS = [("A fact the user mentioned", "q_4feb114c6944"),
+         ("A fact that changed", "q_92447a8c097c"),
+         ("A trap: the answer isn't there", "q_43824099a143"),
+         ("Something the assistant said", "q_14252c64d73d")]
+
+st.set_page_config(page_title="Recall", page_icon="🔎", layout="centered", initial_sidebar_state="collapsed")
+
+# ---------- style ----------
+# Framed sheet (taste-skill app style, seed 655928746): the page ground #f2f4f6, one white sheet with a 1px edge and
+# 16px corners, no shadows. One accent, teal, on the mark, the active tab, the efficiency bar, links and focus. The
+# highlighter is only ever on cited text.
+st.html("""
 <style>
-.block-container {padding-top: 2rem; max-width: 1200px;}
-.card {background: #161b26; border: 1px solid #262d3d; border-radius: 12px; padding: 18px 22px; margin-bottom: 12px;}
-.answer {font-size: 1.6rem; font-weight: 600; line-height: 1.35; color: #f2f4f8;}
-.muted {color: #8a93a6; font-size: 0.85rem;}
-.badge {display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
-        margin-right: 6px; border: 1px solid transparent;}
-.b-abstain {background: #3a2a12; color: #ffb547; border-color: #6b4a14;}
-.b-ok {background: #11331f; color: #4cd787; border-color: #1d5c37;}
-.b-bad {background: #3a1518; color: #ff6b74; border-color: #6b2329;}
-.b-judge {background: #23283a; color: #a9b4d0; border-color: #39415a;}
-.b-cited {background: #1b2a52; color: #9db4ff; border-color: #34508f;}
-.b-gold {background: #33300f; color: #e9d76b; border-color: #5e5719;}
-.b-recent {background: #12303a; color: #5fd0e8; border-color: #1f5563;}
-.excerpt {background: #12161f; border: 1px solid #232a38; border-left: 4px solid #2a3142; border-radius: 10px;
-          padding: 12px 16px; margin-bottom: 10px;}
-.excerpt.cited {border-left-color: #7c9cff; background: #141b2c;}
-.excerpt pre {white-space: pre-wrap; font-family: inherit; font-size: 0.86rem; color: #c9cfdb; margin: 8px 0 0 0;
-              max-height: 260px; overflow-y: auto;}
-.role {font-weight: 700; color: #7c9cff;}
-.role-a {font-weight: 700; color: #b48cff;}
-.hint {background: #2b2410; border: 1px solid #5e4c14; border-radius: 10px; padding: 10px 14px; color: #f0d58a;}
+@import url('https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&display=swap');
+:root {
+  --ground: #f2f4f6; --surface: #ffffff; --raised: #f7f8fa; --active: #e9edf1;
+  --border: #e3e7eb; --rule: #edf0f3; --control: #cbd2d9;
+  --ink: #1c2430; --muted: #5e6876; --accent: #0e5a5f; --accent-soft: #e3eeee;
+  --mark: rgba(255, 230, 138, 0.6); --notice-bg: #f6f2e3; --notice-ink: #5c4a12;
+  --font: "Schibsted Grotesk", system-ui, sans-serif;
+}
+html, body, .stApp, .stApp * { font-family: var(--font); }
+[data-testid="stIconMaterial"], .material-symbols-rounded { font-family: "Material Symbols Rounded" !important; }
+.stApp { background: var(--ground); color: var(--ink); }
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stToolbarActions"], [data-testid="stMainMenu"], [data-testid="stAppDeployButton"],
+.stDeployButton, footer, [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
+.block-container { max-width: 808px; padding: 40px 24px 96px; }
+[data-testid="stSidebar"] { background: var(--ground); border-right: 1px solid var(--border); }
+*:focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 2px; }
+
+/* header */
+.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin: 0 0 4px; }
+.brand .word { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; color: var(--ink); }
+.brand .word b { color: var(--accent); font-weight: 700; }
+.brand .line { font-size: 15px; color: var(--muted); }
+.try { font-size: 14px; color: var(--muted); margin: 22px 0 8px; }
+
+/* buttons: quiet, white, 1px control edge; the chosen demo takes the neutral active fill */
+.stButton > button { background: var(--surface); color: var(--ink); border: 1px solid var(--control);
+  border-radius: 8px; min-height: 44px; font-size: 14px; font-weight: 500; line-height: 1.3;
+  padding: 8px 12px; box-shadow: none; text-align: left; justify-content: flex-start; }
+.stButton > button > div, .stButton > button > div > span { justify-content: flex-start; width: 100%; }
+.stButton > button:hover { border-color: var(--ink); color: var(--ink); background: var(--surface); }
+.stButton > button[kind="primary"], [data-testid="stBaseButton-primary"] { background: var(--active);
+  border-color: var(--ink); color: var(--ink); }
+.stButton > button p, .stButton > button div { font-size: 14px; white-space: normal; overflow: visible;
+  text-overflow: clip; text-align: left; }
+[data-testid="stExpander"] details { border: none; background: transparent; }
+[data-testid="stExpander"] summary { padding-left: 0; color: var(--muted); font-size: 14px; }
+[data-testid="stExpander"] summary:hover { color: var(--ink); }
+
+/* the sheet */
+.st-key-sheet { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+  padding: 32px 32px 24px; margin-top: 12px; }
+h1.question { font-size: 30px; line-height: 1.2; font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+  margin: 0; padding: 0; }
+.meta { font-size: 15px; color: var(--muted); margin-top: 8px; }
+.answer-label { font-size: 14px; color: var(--muted); margin-top: 28px; }
+.answer { font-size: 40px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; color: var(--ink);
+  margin-top: 6px; overflow-wrap: anywhere; }
+.answer.long { font-size: 28px; line-height: 1.25; }
+.answer.none { font-size: 24px; font-weight: 500; color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.chip { font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 999px;
+  padding: 4px 11px; text-decoration: none; white-space: nowrap; }
+.chip:hover { text-decoration: underline; }
+.status { font-size: 16px; color: var(--ink); margin-top: 16px; }
+.status .why { color: var(--muted); }
+.efficiency { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 15px;
+  color: var(--muted); }
+.efficiency b { color: var(--ink); font-weight: 600; }
+.bar { height: 4px; background: var(--rule); border-radius: 2px; margin-top: 10px; overflow: hidden; }
+.bar span { display: block; height: 4px; background: var(--accent); border-radius: 2px; min-width: 3px; }
+
+/* tabs: a 2px teal underline on a 1px rule */
+.stTabs [data-baseweb="tab-list"] { gap: 24px; border-bottom: 1px solid var(--border); margin-top: 20px; }
+.stTabs [data-baseweb="tab"] { padding: 10px 0; font-size: 15px; color: var(--muted); }
+.stTabs [data-baseweb="tab"] p { font-size: 15px; }
+.stTabs [aria-selected="true"] { color: var(--ink); }
+.stTabs [data-baseweb="tab-highlight"] { background: var(--accent); height: 2px; }
+.stTabs [data-baseweb="tab-border"] { display: none; }
+
+/* sources */
+.sources-intro { font-size: 14px; color: var(--muted); margin: 4px 0 12px; }
+.hint { background: var(--notice-bg); color: var(--notice-ink); border-radius: 10px; padding: 12px 14px;
+  font-size: 15px; line-height: 1.5; margin-bottom: 12px; }
+details.src { border-top: 1px solid var(--rule); padding: 14px 0; }
+details.src:last-of-type { border-bottom: 1px solid var(--rule); }
+details.src summary { list-style: none; cursor: pointer; border-radius: 6px; }
+details.src summary::-webkit-details-marker { display: none; }
+.src .when { font-size: 15px; font-weight: 600; color: var(--ink); }
+.src .when .ago { font-weight: 400; color: var(--muted); }
+.src .when .tag { font-weight: 500; color: var(--accent); margin-left: 6px; }
+.src .snippet { font-size: 15px; line-height: 1.5; color: var(--ink); margin-top: 4px; }
+.src .snippet .open { color: var(--muted); font-size: 14px; margin-left: 6px; white-space: nowrap; }
+details.src[open] .open { display: none; }
+.src .turns { margin-top: 14px; padding: 16px 18px; background: var(--raised); border-radius: 10px;
+  max-height: 460px; overflow-y: auto; }
+.src .turn { margin-bottom: 14px; }
+.src .turn:last-child { margin-bottom: 0; }
+.src .who { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 2px; }
+.src .said { font-size: 15px; line-height: 1.55; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.src .gap { color: var(--muted); font-size: 14px; margin-bottom: 14px; }
+mark.hl { background: var(--mark); color: inherit; padding: 0 2px; border-radius: 2px;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+
+/* how it works, results */
+.prose { font-size: 16px; line-height: 1.6; color: var(--ink); }
+.prose h3 { font-size: 18px; font-weight: 600; margin: 22px 0 6px; }
+.prose ol, .prose ul { padding-left: 22px; margin: 0; }
+.prose li { margin-bottom: 8px; }
+.prose li::marker { font-variant-numeric: normal; }
+.prose .muted { color: var(--muted); }
+table.t { border-collapse: collapse; width: 100%; font-size: 14px; margin: 6px 0 4px; }
+table.t td { font-variant-numeric: tabular-nums; }
+table.t td:first-child { font-variant-numeric: normal; }
+table.t, table.t th, table.t td { font-family: var(--font) !important; }
+table.t th { font-weight: 400; color: var(--muted); text-align: right; padding: 6px 8px;
+  border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.t td { padding: 7px 8px; text-align: right; border-bottom: 1px solid var(--rule); }
+table.t th:first-child, table.t td:first-child { text-align: left; padding-left: 0; width: 34%; }
+table.t tr.all td { font-weight: 600; }
+.tcap { font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+
+/* sidebar details */
+.adv { margin: 0; padding: 0; }
+.adv dt { font-size: 13px; color: var(--muted); margin-top: 10px; }
+.adv dd { font-size: 14px; color: var(--ink); margin: 2px 0 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .block-container { padding: 64px 16px 64px; }
+  .st-key-sheet { padding: 22px 18px 18px; border-radius: 12px; }
+  h1.question { font-size: 24px; }
+  .answer { font-size: 30px; }
+  .answer.long { font-size: 22px; }
+}
 </style>
-""", unsafe_allow_html=True)
+""")
 
 
 # ---------- data ----------
 
-@st.cache_resource(show_spinner="Indexing the histories file (once)...")
+@st.cache_resource(show_spinner="Reading the histories file once...")
 def history_offsets(split: str) -> dict[str, int]:
     """Byte offset of each history's line, found by streaming the file once without parsing it."""
     offsets, pos = {}, 0
@@ -77,9 +192,9 @@ def history_offsets(split: str) -> dict[str, int]:
     return offsets
 
 
-@st.cache_resource(max_entries=12, show_spinner="Building the BM25 index for this history...")
+@st.cache_resource(max_entries=12, show_spinner="Indexing this history...")
 def load_index(split: str, history_id: str) -> tuple[HistoryIndex, int, int]:
-    """(index, the full history's characters, its session count), reading only that history's line."""
+    """(index, the full history's characters, its conversation count), reading only that history's line."""
     with (SPLITS[split] / "histories.jsonl").open("rb") as f:
         f.seek(history_offsets(split)[history_id])
         history = json.loads(f.readline())
@@ -112,28 +227,37 @@ def load_gold(split: str) -> dict[str, dict]:
 
 @st.cache_data(ttl=30)
 def load_runs() -> dict[str, list[dict]]:
-    """Cached Reactor answers by question_id: [{file, version, result, logged}] from every results-*.jsonl."""
+    """Saved Reactor answers by question_id: [{file, version, result, logged}], one per results-*.jsonl, the line
+    make_predictions.py would use."""
     runs: dict[str, list[dict]] = {}
     for path in sorted(ROOT.glob("results*.jsonl")):
         if path.name.endswith(".evidence.jsonl"):
             continue
-        results: dict[str, dict] = {}
-        for r in read_jsonl(path):
-            qid = r.get("question_id")
-            if qid and (r.get("status") == "answered" or results.get(qid, {}).get("status") != "answered"):
-                results[qid] = r
         logged = {e["question_id"]: e for e in read_jsonl(path.with_suffix(".evidence.jsonl")) if "question_id" in e}
-        for qid, result in results.items():
+        for qid, result in choose(read_jsonl(path)).items():
             entry = logged.get(qid)
             runs.setdefault(qid, []).append({"file": path.name, "version": (entry or {}).get("version", 1),
                                              "result": result, "logged": entry})
     return runs
 
 
-# ---------- helpers ----------
+# ---------- text helpers ----------
 
 def date_of(value: str) -> datetime:
     return datetime.strptime(value[:10], "%Y/%m/%d")
+
+
+def day(value: str, year: bool = True) -> str:
+    d = date_of(value)
+    return f"{d.day} {d:%B %Y}" if year else f"{d.day} {d:%b}"
+
+
+def short(n: float) -> str:
+    """19,591 -> 19.6k; 497,191 -> 497k."""
+    if n < 1000:
+        return f"{n:,.0f}"
+    k = n / 1000
+    return f"{k:,.0f}k" if k >= 100 else f"{k:.1f}k"
 
 
 def parse_excerpt(text: str) -> tuple[int | None, bool, str]:
@@ -151,29 +275,79 @@ def parse_excerpt(text: str) -> tuple[int | None, bool, str]:
     return days, recent, "\n".join(lines)
 
 
-def render_turns(text: str) -> str:
-    """Excerpt text as HTML, with the speaker labels styled."""
-    def role(m: re.Match) -> str:
-        cls = "role-a" if m.group(1) == "assistant" else "role"
-        label = "user · elsewhere in this chat" if m.group(1).startswith("user (") else m.group(1)
-        return f'\x00{cls}\x01{label}\x02'
-    marked = html.escape(ROLE.sub(role, text))
-    return re.sub("\x00(.*?)\x01(.*?)\x02", r'<span class="\1">\2:</span> ', marked)
+MARKUP = re.compile(r"\*\*|__|^#{1,6}\s+", re.MULTILINE)
 
 
-def badge(text: str, cls: str) -> str:
-    return f'<span class="badge {cls}">{html.escape(text)}</span>'
+def plain(text: str) -> str:
+    """Chat text as plain text: markdown's bold and heading markers dropped, nothing else interpreted."""
+    return MARKUP.sub("", text)
 
 
-def fmt_int(n: float) -> str:
-    return f"{n:,.0f}"
+def turns_of(body: str) -> list[tuple[str, str]]:
+    """[(speaker, text)] of an excerpt's history text; ("", "...") marks a gap between turns."""
+    out, last = [], 0
+    marks = list(TURN.finditer(body))
+    for n, m in enumerate(marks):
+        text = body[m.end():marks[n + 1].start() if n + 1 < len(marks) else len(body)].strip("\n")
+        who = {"user": "You", "assistant": "Assistant"}.get(m.group(1), "You, elsewhere in this conversation")
+        gap = text.endswith("\n...")
+        out.append((who, plain(text[:-4] if gap else text)))
+        if gap:
+            out.append(("", "..."))
+    return out
 
 
-def show_table(rows: dict[str, dict]) -> None:
-    """A metrics table: counts as integers, rates to three decimals, missing values as a dash."""
-    cell = lambda v: "–" if v is None else f"{v:.3f}" if isinstance(v, float) else str(v)
-    st.dataframe(pd.DataFrame({k: {c: cell(v) for c, v in row.items()} for k, row in rows.items()}).T,
-                 width="stretch")
+def keywords(question: str) -> set[str]:
+    """The question's stemmed content words."""
+    return set(tokenize(question))
+
+
+def best_sentence(text: str, words: set[str]) -> str:
+    """The sentence of ``text`` that holds the most question words (the first sentence when none does)."""
+    best, score = "", -1
+    for sentence in SENTENCE.split(text):
+        sentence = sentence.strip()
+        if len(sentence) < 3:
+            continue
+        hits = len({stem(w.lower()) for w in WORD.findall(sentence) if w.lower() not in STOPWORDS} & words)
+        if hits > score:
+            best, score = sentence, hits
+    return best
+
+
+def clip_line(text: str, limit: int = 150) -> str:
+    """One line of ``text``, cut at a word; "…" marks text cut at either end (retrieval trims long turns)."""
+    text = " ".join(text.split())
+    if text[:1].islower():
+        text = "…" + text
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def highlighted(text: str, sentence: str) -> str:
+    """``text`` escaped, with ``sentence`` (if present) under the highlighter."""
+    i = text.find(sentence) if sentence else -1
+    if i < 0:
+        return html.escape(text)
+    return (html.escape(text[:i]) + f'<mark class="hl">{html.escape(sentence)}</mark>'
+            + html.escape(text[i + len(sentence):]))
+
+
+def table(rows: dict[str, dict], columns: list[tuple[str, str]], fmt=None) -> str:
+    """An HTML table: the row name left, numbers right-aligned in tabular figures, a dash for a missing value."""
+    cell = fmt or (lambda v: "–" if v is None else f"{v:.1%}" if isinstance(v, float) else str(v))
+    head = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    body = ""
+    for name, row in rows.items():
+        cls = ' class="all"' if name.lower() in ("all", "overall") else ""
+        body += f"<tr{cls}><td>{html.escape(name)}</td>" + "".join(
+            f"<td>{cell(row.get(key))}</td>" for key, _ in columns) + "</tr>"
+    return f'<table class="t"><thead><tr><th></th>{head}</tr></thead><tbody>{body}</tbody></table>'
+
+
+TYPE_NAMES = {"knowledge-update": "A fact that changed", "multi-session": "Across conversations",
+              "single-session-assistant": "Something the assistant said",
+              "single-session-user": "A fact the user mentioned", "temporal-reasoning": "Dates and order",
+              "all": "All"}
 
 
 def ask_reactor(split: str, history_id: str, qid: str, question: str, question_date: str, version: int,
@@ -201,250 +375,268 @@ def ask_reactor(split: str, history_id: str, qid: str, question: str, question_d
         return client(args, *extra)
 
 
-# ---------- sidebar ----------
+# ---------- sidebar: Advanced ----------
 
-st.sidebar.markdown("## 🧠 Recall")
-st.sidebar.caption("Grounded long-term memory for AI assistants and support teams")
+st.sidebar.markdown("### Advanced")
 split = st.sidebar.radio("Dataset", list(SPLITS), horizontal=True,
-                         help="dev has gold answers; test is the scored split, with no gold released")
+                         help="dev has expected answers; test is the scored set, with none released")
+version = 1 if st.sidebar.radio("Retrieval version", ["v1", "v2"], horizontal=True,
+                                help="v1 produced the submitted answers. v2 adds focused trimming, more room for a "
+                                     "leading conversation, time sentences and the missing-words note.") == "v1" else 2
+live_ready = LIVE and all(os.environ.get(k) for k in LIVE_ENV)
+details_slot = st.sidebar.container()
+st.sidebar.markdown("#### Live mode")
+if live_ready:
+    st.sidebar.write("On. Asking starts a new Reactor history on this agent, which interrupts a benchmark running "
+                     "on it.")
+elif LIVE:
+    st.sidebar.write("Not configured: set " + ", ".join(k for k in LIVE_ENV if not os.environ.get(k)) + ".")
+else:
+    st.sidebar.write("Off. Answers shown are the ones saved from our runs. Start with REACTOR_LIVE=1 to ask Reactor.")
+
 questions = load_questions(split)
+by_id = {q["question_id"]: q for q in questions}
 gold = load_gold(split)
 runs = load_runs()
-cached_ids = {q["question_id"] for q in questions if q["question_id"] in runs}
 
-only_cached = st.sidebar.toggle(f"Only questions with a cached answer ({len(cached_ids)})", value=bool(cached_ids))
-pool = [q for q in questions if not only_cached or q["question_id"] in cached_ids] or questions
+# ---------- header and question picker ----------
+
+st.html('<div class="brand"><span class="word">Recall<b>.</b></span>'
+        '<span class="line">Find answers in months of chat history, with sources.</span></div>')
+
+state = st.session_state
+if state.get("split") != split:  # a new dataset starts on its first demo, or its first answered question
+    state.split = split
+    first = next((qid for _, qid in DEMOS if qid in by_id), None)
+    state.qid = first or next((q["question_id"] for q in questions if q["question_id"] in runs),
+                              questions[0]["question_id"])
+    state.own = False
+
+def show_question(qid: str) -> None:
+    state.qid, state.own = qid, False
 
 
-def label(q: dict) -> str:
-    g = gold.get(q["question_id"])
-    tag = ("unanswerable" if g["abstain"] else g["question_type"]) if g else ""
-    mark = "● " if q["question_id"] in runs else "○ "
-    return mark + (f"[{tag}] " if tag else "") + q["question"][:90]
+def ask_own() -> None:
+    state.own, state.own_text, state.own_day = True, state.own_input.strip(), state.own_date
 
 
-chosen = st.sidebar.selectbox("Question", pool, format_func=label)
-own = st.sidebar.toggle("Ask your own question about this history")
-if own:
-    question_text = st.sidebar.text_area("Your question", value="", placeholder="e.g. Where did I go on my last trip?")
-    day = st.sidebar.date_input("Asked on", value=date_of(chosen["question_date"]).date())
-    question_date = f"{day:%Y/%m/%d} ({day:%a}) {chosen['question_date'][-5:]}"
+demos = [(name, qid) for name, qid in DEMOS if qid in by_id]
+if demos:
+    st.html('<div class="try">Try these</div>')
+    cols = st.columns(len(demos))
+    for col, (name, qid) in zip(cols, demos):
+        chosen = not state.own and state.qid == qid
+        col.button(name, key=f"demo-{qid}", type="primary" if chosen else "secondary", width="stretch",
+                   on_click=show_question, args=(qid,))
+
+with st.expander("Browse all questions or ask your own"):
+    answered_only = st.toggle("Only questions with a saved answer", value=True)
+    pool = [q for q in questions if not answered_only or q["question_id"] in runs] or questions
+    ids = [q["question_id"] for q in pool]
+    if state.qid in ids:
+        state.browse = state.qid  # the list follows the question on screen, whichever control chose it
+    elif state.get("browse") not in ids:
+        state.browse = ids[0]
+    st.selectbox("Question", ids, key="browse", format_func=lambda qid: by_id[qid]["question"],
+                 on_change=lambda: show_question(state.browse))
+    st.write("")
+    st.text_input("Ask your own question about the same history", key="own_input",
+                  placeholder="e.g. Where did I go on my last trip?")
+    st.date_input("As if asked on", key="own_date", value=date_of(by_id[state.qid]["question_date"]).date())
+    st.button("Ask", disabled=not state.get("own_input", "").strip(), on_click=ask_own)
+
+base = by_id[state.qid]
+if state.own:
+    question_text = state.own_text
+    d = state.own_day
+    question_date = f"{d:%Y/%m/%d} ({d:%a}) {base['question_date'][-5:]}"
     qid = "q_custom"
 else:
-    question_text, question_date, qid = chosen["question"], chosen["question_date"], chosen["question_id"]
+    question_text, question_date, qid = base["question"], base["question_date"], base["question_id"]
 
-version = 1 if st.sidebar.radio("Retrieval", ["v1", "v2"], horizontal=True,
-                                help="v1: what the test run sends. v2: focused trimming, a bigger share for a "
-                                     "leading session, time sentences, the missing-words hint") == "v1" else 2
-
-st.sidebar.divider()
-if LIVE and all(os.environ.get(k) for k in LIVE_ENV):
-    st.sidebar.markdown(badge("LIVE REACTOR: ON", "b-ok"), unsafe_allow_html=True)
-    st.sidebar.caption("Asking starts a new Reactor history on this agent, which interrupts a benchmark running "
-                       "on it.")
-elif LIVE:
-    st.sidebar.markdown(badge("LIVE REACTOR: NOT CONFIGURED", "b-bad"), unsafe_allow_html=True)
-    st.sidebar.caption("Set " + ", ".join(k for k in LIVE_ENV if not os.environ.get(k)) + ".")
+index, history_chars, n_sessions = load_index(split, base["history_id"])
+run = None if state.own else next((r for r in reversed(runs.get(qid, [])) if r["version"] == version), None)
+live_key = (split, base["history_id"], question_text, question_date, version)
+live_result = state.get("live", {}).get(live_key)
+if run and run["logged"]:
+    evidence = run["logged"]["evidence"]
+    missing = run["logged"].get("missing") or (index.missing_words(question_text, evidence) if version == 2 else [])
 else:
-    st.sidebar.markdown(badge("LIVE REACTOR: OFF", "b-judge"), unsafe_allow_html=True)
-    st.sidebar.caption("Cached answers only. Start with REACTOR_LIVE=1 to ask Reactor.")
-live_ready = LIVE and all(os.environ.get(k) for k in LIVE_ENV)
+    evidence = index.evidence(question_text, question_date=question_date, version=version)
+    missing = index.missing_words(question_text, evidence) if version == 2 else []
+g = None if state.own else gold.get(qid)
+result = live_result or (run["result"] if run else None)
+prediction = predict(qid, result, {"evidence": evidence})[0] if result else None
+cite_source = predict(qid, result, {"evidence": evidence})[1] if result else "-"
+cited = set(prediction["citations"]) if prediction else set()
+dates = {e["id"]: e["date"] for e in evidence}
+sent_chars = sum(len(e["text"]) for e in evidence) + len(question_text)
+words = keywords(question_text)
 
-ask_tab, results_tab = st.tabs(["Ask", "Results"])
+# ---------- the sheet ----------
 
-# ---------- Ask ----------
+with st.container(key="sheet"):
+    st.html(f'<h1 class="question">{html.escape(question_text)}</h1>'
+            f'<div class="meta">Asked {day(question_date)}, searched {n_sessions} conversations</div>')
 
-def render_ask() -> None:
-    if not question_text.strip():
-        st.info("Type a question in the sidebar.")
-        return
-    index, history_chars, n_sessions = load_index(split, chosen["history_id"])
-    run = None if own else next((r for r in reversed(runs.get(qid, [])) if r["version"] == version), None)
-    live_key = (split, chosen["history_id"], question_text, question_date, version)
-    live_result = st.session_state.get("live", {}).get(live_key)
-
-    if run and run["logged"]:
-        evidence, source_note = run["logged"]["evidence"], f"exactly what was sent ({run['file']})"
-        missing = run["logged"].get("missing") or (index.missing_words(question_text, evidence) if version == 2 else [])
+    said = []  # the status, in plain words
+    if prediction is None:
+        answer_html = ('<div class="answer none">Reactor hasn\'t been asked this one yet. '
+                       'The sources Recall would send are below.</div>')
+    elif result.get("status") != "answered":
+        answer_html = '<div class="answer none">Reactor didn\'t answer in time.</div>'
+        said.append('Recall treats this as "I don\'t know", with no sources.')
+    elif prediction["abstain"]:
+        answer_html = '<div class="answer">I don\'t know.</div>'
+        said.append("Not in the history, so Recall says it doesn\'t know.")
     else:
-        evidence = index.evidence(question_text, question_date=question_date, version=version)
-        missing = index.missing_words(question_text, evidence) if version == 2 else []
-        source_note = f"live retrieval, v{version}"
-    g = None if own else gold.get(qid)
+        text = prediction["answer"]
+        answer_html = f'<div class="answer{" long" if len(text) > 60 else ""}">{html.escape(text)}</div>'
+    if prediction is not None and g:
+        verdict = score_question(prediction, g)["answer"]
+        expected = html.escape("It isn't in the history." if g["abstain"] else g["answer"])
+        said.append({"correct": "Matches the expected answer.",
+                     "unjudged": f'Checked by the judge later. <span class="why">Expected: {expected}</span>',
+                     "wrong": f'Doesn\'t match. <span class="why">Expected: {expected}</span>'}[verdict])
+    status = f'<div class="status">{" ".join(said)}</div>' if said else ""
+    chips = "".join(f'<a class="chip" href="#src-{sid}">{day(dates[sid], year=False)} conversation</a>'
+                    for sid in sorted(cited, key=lambda s: date_of(dates[s])) if sid in dates)
+    ratio = history_chars / max(sent_chars, 1)
+    st.html(f'<div class="answer-label">Answer</div>{answer_html}'
+            + (f'<div class="chips">{chips}</div>' if chips else "") + status
+            + f'<div class="efficiency">Read <b>{short(sent_chars)}</b> of {short(history_chars)} characters, '
+              f'{ratio:.0f}× less than the full history.'
+              f'<div class="bar" role="img" aria-label="{sent_chars / history_chars:.1%} of the history read">'
+              f'<span style="width:{min(sent_chars / history_chars, 1):.2%}"></span></div></div>')
 
-    st.markdown(f"### {html.escape(question_text)}")
-    st.caption(f"Asked {question_date} · history {chosen['history_id']} · {n_sessions} sessions · {split}"
-               + (f" · {g['question_type']}" if g else ""))
+    if live_ready and prediction is None and st.button("Ask Reactor"):
+        with st.spinner("Reactor is answering, usually within a minute..."):
+            answer = ask_reactor(split, base["history_id"], qid, question_text, question_date, version,
+                                 evidence, missing)
+        state.setdefault("live", {})[live_key] = answer
+        st.rerun()
 
-    result = live_result or (run["result"] if run else None)
-    left, right = st.columns([3, 2])
-    with left:
-        if result:
-            prediction, cite_source = predict(qid, result, {"evidence": evidence})
-            abstained = prediction["abstain"]
-            status = result.get("status")
-            if status != "answered":
-                body = f"No answer: {html.escape(status or 'error')}"
-                badges = badge("ABSTAINED", "b-abstain")
-            elif abstained:
-                body, badges = "I don't know: the history doesn't contain this.", badge("ABSTAINED", "b-abstain")
-            else:
-                body, badges = html.escape(prediction["answer"]), ""
-            meta = []
-            if result.get("latency_s") is not None:
-                meta.append(f"{result['latency_s']:.0f} s")
-            meta.append("live" if live_result else f"cached · {run['file']}")
-            if not abstained:
-                meta.append(f"citations from {cite_source}")
-            st.markdown(f'<div class="card"><div class="muted">Reactor answer</div>{badges}'
-                        f'<div class="answer">{body}</div><div class="muted">{" · ".join(meta)}</div></div>',
-                        unsafe_allow_html=True)
-            cited = set(prediction["citations"])
-        else:
-            prediction, cited = None, set()
-            st.markdown('<div class="card"><div class="muted">Reactor answer</div><div class="answer" '
-                        'style="font-size:1.1rem;color:#8a93a6">Reactor answer not cached'
-                        f'{" for v" + str(version) if runs.get(qid) else ""}</div>'
-                        '<div class="muted">Retrieval below is live; no Reactor call was made.</div></div>',
-                        unsafe_allow_html=True)
-            if live_ready and st.button("Ask Reactor", type="primary"):
-                with st.spinner("Reactor is answering (typically under a minute)..."):
-                    answer = ask_reactor(split, chosen["history_id"], qid, question_text, question_date, version,
-                                         evidence, missing)
-                st.session_state.setdefault("live", {})[live_key] = answer
-                st.rerun()
-    with right:
-        if g:
-            if prediction:
-                verdict = score_question(prediction, g)
-                mark = {"correct": badge("CORRECT", "b-ok"), "wrong": badge("INCORRECT", "b-bad"),
-                        "unjudged": badge("NEEDS JUDGE", "b-judge")}[verdict["answer"]]
-                f1 = verdict["evidence_f1"]
-                extra = f'<div class="muted">evidence F1 {f1:.2f}</div>' if f1 is not None else ""
-            else:
-                mark, extra = "", ""
-            expected = "Unanswerable: " + g["answer"] if g["abstain"] else g["answer"]
-            st.markdown(f'<div class="card"><div class="muted">Gold answer</div>{mark}'
-                        f'<div style="font-size:1.05rem;margin-top:6px">{html.escape(expected)}</div>{extra}'
-                        f'<div class="muted" style="margin-top:6px">"Needs judge": the answer is not an exact '
-                        f'match; official scoring sends it to an LLM judge.</div></div>', unsafe_allow_html=True)
-        elif split == "test":
-            st.markdown('<div class="card"><div class="muted">Gold answer</div>Not released for the test split.'
-                        '</div>', unsafe_allow_html=True)
+    sources_tab, how_tab, results_tab = st.tabs(["Sources", "How it works", "Results"])
 
-    # efficiency
-    sent_chars = sum(len(e["text"]) for e in evidence) + len(question_text)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Characters sent", fmt_int(sent_chars), help="evidence excerpts + question")
-    c2.metric("Full history", fmt_int(history_chars), help="every turn of every session in this history")
-    c3.metric("Reduction", f"{history_chars / max(sent_chars, 1):.0f}×")
-    c4.metric("Tokens (≈ chars/4)", f"{fmt_int(sent_chars / 4)} vs {fmt_int(history_chars / 4)}")
+    with sources_tab:
+        intro = (f"{len(evidence)} conversations Recall sent to Reactor, oldest first."
+                 + (" Highlighted: the ones the answer cites." if cited else ""))
+        parts = [f'<div class="sources-intro">{intro}</div>']
+        if missing:
+            parts.append(f'<div class="hint">These words from the question appear nowhere in these conversations: '
+                         f'<b>{html.escape(", ".join(missing))}</b>. If the answer depends on them, Reactor is told '
+                         f'to say it doesn\'t know. This is how near-miss traps are caught.</div>')
+        for e in evidence:
+            days, recent, body = parse_excerpt(e["text"])
+            is_cited = e["id"] in cited
+            turns = turns_of(body)
+            spoken = " ".join(t for who, t in turns if who)
+            snippet = best_sentence(spoken, words)
+            ago = ("on the day of the question" if days == 0 else f"{days} day{'' if days == 1 else 's'} "
+                   "before the question") if days is not None else ""
+            tags = (' <span class="tag">cited</span>' if is_cited else "") + \
+                   (' <span class="tag">most recent</span>' if recent else "")
+            one_line = clip_line(snippet)
+            shown = f'<mark class="hl">{html.escape(one_line)}</mark>' if is_cited else html.escape(one_line)
+            inner = ""
+            for who, text in turns:
+                if not who:
+                    inner += '<div class="gap">…</div>'
+                    continue
+                said = highlighted(text, snippet) if is_cited else html.escape(text)
+                inner += f'<div class="turn"><div class="who">{html.escape(who)}:</div><div class="said">{said}</div></div>'
+            parts.append(f'<details class="src" id="src-{html.escape(e["id"])}"><summary>'
+                         f'<div class="when">{day(e["date"])}{", " + ago if ago else ""}'
+                         f'{tags}</div>'
+                         f'<div class="snippet">{shown}<span class="open">Show conversation</span></div>'
+                         f'</summary><div class="turns">{inner}</div></details>')
+        if not evidence:
+            parts.append('<div class="sources-intro">Nothing in this history matches the question\'s words.</div>')
+        st.html("".join(parts))
 
-    # evidence timeline
-    st.markdown("#### Evidence timeline")
-    st.caption(f"{len(evidence)} excerpts in date order · {source_note}. Highlighted: cited for the answer.")
-    if missing:
-        st.markdown(f'<div class="hint">⚠ Missing-words hint (v2): the evidence never mentions '
-                    f'<b>{html.escape(", ".join(missing))}</b>. Reactor is told to abstain if the answer depends on '
-                    f'them: this is how near-miss traps are caught.</div>', unsafe_allow_html=True)
-        st.write("")
-    gold_sessions = set(g["evidence"]) if g else set()
-    for n, e in enumerate(evidence, 1):
-        days, recent, body = parse_excerpt(e["text"])
-        chips = [badge(f"E{n}", "b-judge")]
-        if e["id"] in cited:
-            chips.append(badge("cited", "b-cited"))
-        if recent:
-            chips.append(badge("most recent", "b-recent"))
-        if e["id"] in gold_sessions:
-            chips.append(badge("gold evidence", "b-gold"))
-        when = e.get("date", "")
-        if days is not None:
-            when += f" · {days} day{'' if days == 1 else 's'} before the question"
-        st.markdown(f'<div class="excerpt{" cited" if e["id"] in cited else ""}">{"".join(chips)}'
-                    f'<span class="muted">{html.escape(when)} · {html.escape(e["id"])}</span>'
-                    f'<pre>{render_turns(body)}</pre></div>', unsafe_allow_html=True)
-    if not evidence:
-        st.info("Nothing in this history matches the question's words.")
+    with how_tab:
+        st.html(f"""<div class="prose">
+<h3>What Recall does</h3>
+<ol>
+<li><b>Reads the whole history once.</b> Every message, yours and the assistant's, is indexed so it can be
+searched in a fraction of a second.</li>
+<li><b>Works out what kind of question it is.</b> Questions that count, add up or put things in order get more
+conversations and more room than a simple lookup.</li>
+<li><b>Picks the few passages that matter.</b> From each matching conversation it keeps the best messages and the
+ones either side, with the date and how long before the question it was.</li>
+<li><b>Reactor answers from those passages.</b> It must point to the passages it used, give one value, and use the
+most recent one when something changed.</li>
+<li><b>Recall checks the sources, or says it doesn't know.</b> It cites only conversations that support the answer.
+If Reactor finds nothing that answers the question, Recall says so, with no sources.</li>
+</ol>
+<h3>The hard cases it handles</h3>
+<ul>
+<li><b>Facts that changed:</b> passages are in date order and the latest is marked, so the newest value wins unless
+you ask for the old one.</li>
+<li><b>Dates and order:</b> each passage says how many days before the question it was, worked out in code.</li>
+<li><b>Near-miss traps:</b> a question can be almost answerable. Recall names the words that appear nowhere in the
+passages, so Reactor says it doesn't know instead of guessing.</li>
+<li><b>Something the assistant said:</b> the assistant's messages are searched too, for "what did you recommend"
+questions.</li>
+<li><b>Questions with no answer:</b> "I don't know" is an answer, and it comes with no sources.</li>
+</ul>
+<p class="muted">On this history Recall read {short(sent_chars)} of {short(history_chars)} characters. Each answer
+costs less, comes back faster, and points to the conversation it came from.</p>
+</div>""")
 
-    with st.expander("How it works"):
-        st.markdown(f"""
-**Recall** answers questions about months of past conversations: it finds the few relevant turns, has Reactor
-answer from them with citations, and says *I don't know* when the history doesn't hold the answer.
+    with results_tab:
+        dev_gold = load_gold("dev")
+        out = []
+        files = sorted({r["file"] for rs in runs.values() for r in rs})
+        for name in files:
+            entries = [(q, r) for q, rs in runs.items() for r in rs if r["file"] == name and q in dev_gold]
+            if not entries:
+                continue
+            scored = [score_question(predict(q, r["result"], r["logged"])[0], dev_gold[q]) for q, r in entries]
+            rows = {TYPE_NAMES.get(k, k): v for k, v in summarize(scored).items()}
+            out.append(f'<div class="prose"><h3>Answers on {len(entries)} practice questions</h3></div>')
+            out.append(table(rows, [("n", "Questions"), ("correct", "Match"), ("unjudged", "For the judge"),
+                                    ("abstention_recall", "Rightly said “don't know”"),
+                                    ("evidence_f1", "Sources right")]))
+            out.append('<div class="tcap">Scored with the organisers\' checker on one saved run. "For the judge": not '
+                       'an exact match, so the official judge decides.</div>')
+        test_runs = [r for q in load_questions("test") for r in runs.get(q["question_id"], [])]
+        if test_runs:
+            answered = sum(r["result"].get("status") == "answered" for r in test_runs)
+            out.append(f'<div class="prose"><h3>Test run</h3><p>{answered} of {len(load_questions("test"))} test '
+                       f'questions answered so far. Expected answers for test aren\'t released.</p></div>')
+        for split_name, title in (("dev", "Finding the right conversations, 526 practice questions"),
+                                  ("dev-large-130", "The same, with 10 times longer histories (130 questions)")):
+            paths = {v: ROOT / "metrics" / f"retrieval-{split_name}-v{v}.json" for v in (1, 2)}
+            if not all(p.exists() for p in paths.values()):
+                continue
+            data = {v: json.loads(p.read_text(encoding="utf-8"))["rows"] for v, p in paths.items()}
+            rows = {TYPE_NAMES.get(k, k): {"n": data[1][k]["n"], **{f"{m} v{v}": data[v][k].get(m)
+                                                                    for m in ("hit@5", "ans∈ev") for v in (1, 2)}}
+                    for k in data[1]}
+            out.append(f'<div class="prose"><h3>{title}</h3></div>')
+            out.append(table(rows, [("n", "Questions"), ("hit@5 v1", "Found, v1"), ("hit@5 v2", "Found, v2"),
+                                    ("ans∈ev v1", "Answer sent, v1"), ("ans∈ev v2", "Answer sent, v2")]))
+            out.append('<div class="tcap">Found: a right conversation is in the top 5. Answer sent: the expected '
+                       'answer is in the passages sent to Reactor. Measured offline (eval_retrieval.py).</div>')
+        st.html("".join(out) or '<div class="sources-intro">No results saved yet.</div>')
 
-1. **Index.** Every turn of every session, user and assistant, becomes a BM25 chunk (long turns split into
-   1,500-character windows). Built once per history, in under a second, standard library only.
-2. **Route.** Questions that count, total, compare or order ("how many", "which first", "how long ago") get
-   8 sessions and 24,000 characters; others get 5 sessions and 12,000.
-3. **Retrieve and trim.** Sessions are ranked by their best turns. Each excerpt keeps the best-matching turns
-   with one turn either side, its date and how many days before the question it was. v2 trims long turns around
-   the question's words, gives a clearly leading session more room, and adds the user's own time references
-   ("last month", "three weeks ago") for temporal questions.
-4. **Reactor answers with citations.** The question goes to Reactor with the excerpts labelled [E1], [E2]...
-   and instructions: cite on the answer line, one value only, the most recent value wins, and work out
-   counts, totals and orders step by step.
-5. **Support check / abstain.** Citations come from Reactor's labels; without labels, only from excerpts that
-   actually contain the answer. If Reactor says INSUFFICIENT_EVIDENCE, Recall abstains, with no citations.
+# ---------- sidebar: technical details ----------
 
-**Edge cases handled**
-- **Knowledge updates**: excerpts are in date order and the latest is marked *most recent*; Reactor is told the
-  most recent value wins, except when the question asks for the previous one.
-- **Temporal questions**: each excerpt says how many days before the question it happened, computed in code.
-- **Near-miss traps**: v2 names the question's words that appear nowhere in the evidence (the *missing-words
-  hint*) so that Reactor abstains instead of stitching an answer together.
-- **Assistant-said facts**: assistant turns are indexed too, so "what did you recommend" questions find them.
-- **Unanswerable questions**: Reactor's INSUFFICIENT_EVIDENCE becomes an abstention with no citations.
-
-**Why it matters**: this history is {fmt_int(history_chars)} characters; Recall sends {fmt_int(sent_chars)}
-({history_chars / max(sent_chars, 1):.0f}× less), so each answer is cheaper and faster, and every claim
-points to the conversation it came from.
-""")
-
-
-with ask_tab:
-    render_ask()
-
-# ---------- Results ----------
-
-with results_tab:
-    dev_gold = load_gold("dev")
-    files = sorted({r["file"] for rs in runs.values() for r in rs})
-    st.markdown("#### Answer accuracy on cached dev runs")
-    shown = False
-    for name in files:
-        entries = [(qid, r) for qid, rs in runs.items() for r in rs if r["file"] == name and qid in dev_gold]
-        if not entries:
-            continue
-        shown = True
-        scored = [score_question(predict(qid, r["result"], r["logged"])[0], dev_gold[qid]) for qid, r in entries]
-        st.markdown(f"**{name}** · {len(entries)} questions · retrieval v{entries[0][1]['version']}")
-        show_table(summarize(scored))
-    if not shown:
-        st.info("No cached dev runs yet (results-*.jsonl in the repo root).")
-    st.caption("score.py's automatic matcher: 'unjudged' answers go to the LLM judge in official scoring.")
-
-    test_runs = [r for q in load_questions("test") for r in runs.get(q["question_id"], [])]
-    if test_runs:
-        answered = sum(r["result"].get("status") == "answered" for r in test_runs)
-        abstained = sum(bool(r["result"].get("abstained")) for r in test_runs)
-        st.markdown("#### Test run")
-        st.write(f"{len(test_runs)} of {len(load_questions('test'))} test questions have a result "
-                 f"({answered} answered, {abstained} abstained). No gold is released for test.")
-
-    st.markdown("#### Retrieval quality (offline, no Reactor)")
-    st.caption("hit@5: a gold session is among the top 5 · sent: share of gold sessions in the evidence sent · "
-               "ans∈ev: the gold answer appears in the evidence sent. From eval_retrieval.py --json.")
-    for split_name, title in (("dev", "dev (all 526 questions, ~50 sessions per history)"),
-                              ("dev-large-130", "dev-large (130 questions, ~500 sessions per history)")):
-        tables = {v: ROOT / "metrics" / f"retrieval-{split_name}-v{v}.json" for v in (1, 2)}
-        if not all(p.exists() for p in tables.values()):
-            continue
-        data = {v: json.loads(p.read_text(encoding="utf-8"))["rows"] for v, p in tables.items()}
-        rows = {}
-        for key in data[1]:
-            rows[key] = {"n": data[1][key]["n"]}
-            for metric in ("hit@5", "sent", "ans∈ev"):
-                for v in (1, 2):
-                    rows[key][f"{metric} v{v}"] = data[v][key].get(metric)
-        st.markdown(f"**{title}**")
-        show_table(rows)
+with details_slot:
+    st.markdown("#### Details")
+    rows = [("Question id", qid), ("History", f"{base['history_id']}, {n_sessions} conversations"),
+            ("Retrieval", f"v{version}, {len(evidence)} passages, {sent_chars:,} characters "
+                          f"(about {sent_chars / 4:,.0f} tokens; full history about {history_chars / 4:,.0f})")]
+    if result:
+        rows += [("Answer from", "a live Reactor call" if live_result else run["file"]),
+                 ("Status", result.get("status", "-")),
+                 ("Latency", f"{result['latency_s']:.0f} s" if result.get("latency_s") is not None else "-"),
+                 ("Citations from", cite_source)]
+        if g and prediction:
+            f1 = score_question(prediction, g)["evidence_f1"]
+            rows.append(("Evidence F1", "-" if f1 is None else f"{f1:.2f}"))
+    else:
+        rows.append(("Answer", f"none saved for v{version}"))
+    st.html('<dl class="adv">' + "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(str(v))}</dd>" for k, v in rows)
+            + "</dl>")

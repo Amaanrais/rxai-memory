@@ -98,8 +98,8 @@ p, li { font-size: 17px; line-height: 1.47; }
 /* the wordmark: small and fixed in the top-left corner on every screen, large over the start screen's title */
 .st-key-brand { position: fixed; top: 17px; left: 22px; width: auto; z-index: 1000001; }
 [data-testid="stToolbar"] > div:first-child { padding-left: 82px; }  /* the sidebar arrow and pages after it */
-.wordmark { font-size: 20px; line-height: 1; font-weight: 700; letter-spacing: -0.02em; color: var(--ink); }
-.wordmark .dot { color: var(--accent); }
+.wordmark { font-size: 20px; line-height: 1; font-weight: 700; letter-spacing: -0.02em; color: var(--accent); }
+.wordmark .dot { color: var(--accent-ring); }
 .hero .wordmark { font-size: 40px; letter-spacing: -0.03em; }
 .about-head { margin: 0 0 8px; }
 .about-head .wordmark { font-size: 40px; letter-spacing: -0.03em; }

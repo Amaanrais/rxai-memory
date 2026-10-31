@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import streamlit as st
 
 from make_predictions import choose, predict
-from retrieval import STOPWORDS, HistoryIndex, is_aggregate, is_name_question, stem, tokenize
+from retrieval import STOPWORDS, HistoryIndex, is_name_question, route, stem, tokenize
 from score import score_question, summarize
 
 ROOT = Path(__file__).resolve().parent
@@ -421,12 +421,14 @@ def ask_reactor(split: str, history_id: str, qid: str, question: str, question_d
         if new.get("status") != "history":
             return {"status": "error", "error": f"--new-history failed: {new.get('error') or new.get('status')}"}
         histories[key] = new["history_id"]
-    text = prompt(question) if version == 1 else prompt_v2(question, missing)
+    # v3 as submitted (run_v3_test.py): no missing-words hint, lenient abstain line
+    text = (prompt(question) if version == 1 else prompt_v2(question, missing) if version == 2
+            else prompt_v2(question, [], True))
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "evidence.json"
         path.write_text(json.dumps(evidence), encoding="utf-8")
         extra = ["--history", histories[key], "--question", text, "--question-date", question_date,
-                 "--question-id", qid, "--max-chars", str(ROUTED_MAX_CHARS if is_aggregate(question) else MAX_CHARS)]
+                 "--question-id", qid, "--max-chars", str(ROUTED_MAX_CHARS if route(question, version)[1] > 12000 else MAX_CHARS)]
         if evidence:
             extra += ["--evidence", str(path)]
         return client(args, *extra)
@@ -450,10 +452,11 @@ def plural(n: int, word: str) -> str:
 st.sidebar.markdown("### Advanced")
 split = st.sidebar.radio("Dataset", list(SPLITS), horizontal=True,
                          help="dev is the practice set, with expected answers; test is the scored set")
-version = 1 if st.sidebar.radio("Retrieval version", ["v1", "v2"], horizontal=True,
-                                help="v1 produced the submitted answers. v2 adds focused trimming, more room for a "
-                                     "leading conversation, time sentences and the missing-words note. The trap "
-                                     "suggestion always uses v2.") == "v1" else 2
+version = int(st.sidebar.radio("Retrieval version", ["v1", "v2", "v3"], index=2, horizontal=True,
+                                help="v3 produced the submitted answers: v2 plus name search and a wider budget "
+                                     "for name questions. v2 adds focused trimming, more room for a leading "
+                                     "conversation, time sentences and the missing-words note. v1 was the first "
+                                     "test run. The trap suggestion always uses v2.")[1])
 live_ready = LIVE and all(os.environ.get(k) for k in LIVE_ENV)
 st.sidebar.markdown("#### Live answers")
 if live_ready:
@@ -507,10 +510,10 @@ def resolve(turn: dict) -> SimpleNamespace:
     live_result = state.get("live", {}).get(live_key)
     if run and run["logged"]:
         evidence = run["logged"]["evidence"]
-        missing = run["logged"].get("missing") or (index.missing_words(turn["question"], evidence) if v == 2 else [])
+        missing = run["logged"].get("missing") or (index.missing_words(turn["question"], evidence) if v >= 2 else [])
     else:
         evidence = index.evidence(turn["question"], question_date=turn["date"], version=v)
-        missing = index.missing_words(turn["question"], evidence) if v == 2 else []
+        missing = index.missing_words(turn["question"], evidence) if v >= 2 else []
     result = live_result or (run["result"] if run else None)
     prediction, cite_source = predict(qid or "q_custom", result, {"evidence": evidence}) if result else (None, "")
     evidence_chars = sum(len(e["text"]) for e in evidence)

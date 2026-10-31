@@ -1,0 +1,208 @@
+1
+00:00:00,000 --> 00:00:05,720
+This is Recall, our solution to the RxAI Memory Retrieval Challenge, by Amaan Rais,
+
+2
+00:00:05,720 --> 00:00:11,302
+Dedar Alam and Frensi Qatipi. Recall finds the few turns that matter in months of
+
+3
+00:00:11,302 --> 00:00:15,024
+chat history, and cites only what supports the answer.
+
+4
+00:00:15,724 --> 00:00:19,723
+Here's the problem. Each test user has two hundred conversations:
+
+5
+00:00:19,723 --> 00:00:22,369
+about one point six six million characters.
+
+6
+00:00:22,369 --> 00:00:25,692
+Reactor takes sixteen thousand characters per message.
+
+7
+00:00:25,692 --> 00:00:30,799
+Some questions can't be answered at all, and near-miss conversations are planted to
+
+8
+00:00:30,799 --> 00:00:31,660
+look relevant.
+
+9
+00:00:32,360 --> 00:00:35,867
+So our code picks the evidence, and Reactor answers.
+
+10
+00:00:35,867 --> 00:00:41,464
+We index every turn, route the question by type, retrieve the best turns with their
+
+11
+00:00:41,464 --> 00:00:46,724
+dates, let Reactor answer from labelled excerpts, then check its citations, or
+
+12
+00:00:46,724 --> 00:00:47,264
+abstain.
+
+13
+00:00:47,964 --> 00:00:52,942
+A few decisions matter most. We search turns, not whole conversations, because a
+
+14
+00:00:52,942 --> 00:00:58,170
+fact usually lives in one turn. Counting and ordering questions get a bigger budget.
+
+15
+00:00:58,170 --> 00:01:03,211
+And dates are worked out in our code: every excerpt says how many days before the
+
+16
+00:01:03,211 --> 00:01:07,380
+question it was said. All in plain Python, with no external models.
+
+17
+00:01:08,080 --> 00:01:12,372
+Citations follow the organisers' rule: they must support the answer.
+
+18
+00:01:12,372 --> 00:01:17,673
+Reactor's own labels come first, then excerpts that actually contain its answer, and
+
+19
+00:01:17,673 --> 00:01:22,912
+never the top result by default. When Reactor says the evidence is insufficient, we
+
+20
+00:01:22,912 --> 00:01:24,616
+abstain, with no citations.
+
+21
+00:01:25,316 --> 00:01:28,543
+This is our demo app. You chat with your own history.
+
+22
+00:01:28,543 --> 00:01:31,283
+We ask: what did I bake for my niece's party?
+
+23
+00:01:31,283 --> 00:01:35,424
+Recall searches forty-eight past conversations, and Reactor answers:
+
+24
+00:01:35,424 --> 00:01:39,260
+lemon blueberry cake, from our chat on the twenty-sixth of May.
+
+25
+00:01:39,960 --> 00:01:42,798
+Sources shows exactly what Reactor was given:
+
+26
+00:01:42,798 --> 00:01:47,654
+a few excerpts, oldest first, each with its date and how many days before the
+
+27
+00:01:47,654 --> 00:01:52,637
+question it was said. The newest is marked most recent, so a value that changed
+
+28
+00:01:52,637 --> 00:01:54,024
+takes its latest form.
+
+29
+00:01:54,724 --> 00:01:59,117
+The About page explains how it works, and its Results tab shows our measured
+
+30
+00:01:59,117 --> 00:02:01,660
+numbers, straight from the evaluation files.
+
+31
+00:02:02,360 --> 00:02:07,383
+That focus pays off. Our submitted run sends a median of eleven point three thousand
+
+32
+00:02:07,383 --> 00:02:12,407
+characters per question: a hundred and forty-seven times less than the full history,
+
+33
+00:02:12,407 --> 00:02:16,952
+and fifteen times less per user than loading the whole history into Reactor.
+
+34
+00:02:17,652 --> 00:02:22,736
+By question type, a correct conversation is in our top five for over ninety-five
+
+35
+00:02:22,736 --> 00:02:27,757
+percent of questions in every type. The hard part is multi-session and temporal
+
+36
+00:02:27,757 --> 00:02:31,380
+questions, where the answer is spread over several turns.
+
+37
+00:02:32,080 --> 00:02:36,755
+Overall, a correct conversation is in the top five for ninety-eight point two
+
+38
+00:02:36,755 --> 00:02:41,309
+percent of dev questions, and ninety-three point five percent on dev-large.
+
+39
+00:02:41,309 --> 00:02:46,349
+On the test set, our submitted run answered a hundred and twenty-three of a hundred
+
+40
+00:02:46,349 --> 00:02:49,203
+and forty-six questions, each with its sources.
+
+41
+00:02:49,203 --> 00:02:51,328
+Accuracy comes from the organisers.
+
+42
+00:02:52,028 --> 00:02:56,858
+Our submission is version three. Version two sharpens the evidence.
+
+43
+00:02:56,858 --> 00:03:02,770
+Version three adds name questions: synonyms, and a boost for a name near the thing
+
+44
+00:03:02,770 --> 00:03:08,754
+asked about. And a lenient abstain line cut our test abstentions from twenty-one to
+
+45
+00:03:08,754 --> 00:03:09,908
+sixteen percent.
+
+46
+00:03:10,608 --> 00:03:16,108
+And we played by the rules: every answer comes from Reactor, one Reactor history per
+
+47
+00:03:16,108 --> 00:03:21,085
+user, careful timeout handling, and evidence logs that make every prediction
+
+48
+00:03:21,085 --> 00:03:21,936
+reproducible.
+
+49
+00:03:22,636 --> 00:03:27,307
+Next: a local reranker for questions worded differently from the chat, dates
+
+50
+00:03:27,307 --> 00:03:32,224
+computed in code, and checking that the lenient line doesn't let trick questions
+
+51
+00:03:32,224 --> 00:03:32,716
+through.
+
+52
+00:03:33,416 --> 00:03:37,376
+Thank you. That's Recall: the needle, not the haystack.
+

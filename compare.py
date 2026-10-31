@@ -6,12 +6,15 @@ against gold, as a table per kind of question and one line per question with the
 
 Predictions are written next to each results file (results-X.jsonl -> predictions-X.jsonl), from its evidence log as
 make_predictions.py reads it. Marks: ✓ correct, ? unjudged (score.py's matcher can't decide; the official judge
-would), ✗ wrong, — abstained. Nothing calls Reactor.
+would), ✗ wrong, — abstained, ! no answer (error, closed, refused, timeout or no result line: make_predictions.py
+turns it into an abstention). The table is printed twice: on every question, and on only the questions where both
+runs got an answer (abstentions included), with how many each run lost. Nothing calls Reactor.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 import make_predictions
@@ -49,9 +52,32 @@ def cell(value) -> str:
     return "-" if value is None else f"{value:.2f}"
 
 
-def shown(prediction: dict, result: dict) -> str:
+def statuses(results: Path, questions: list[dict]) -> dict[str, str]:
+    """Each question's status in a results file, from the line make_predictions.py uses ("no result" if none)."""
+    chosen = make_predictions.choose(read_jsonl(results))
+    return {q["question_id"]: chosen.get(q["question_id"], {}).get("status") or "no result" for q in questions}
+
+
+def shown(prediction: dict, result: dict, status: str) -> str:
+    if status != "answered":
+        return f"!  ({status})"
     text = "—  (abstained)" if prediction["abstain"] else f"{MARK[result['answer']]}  {prediction['answer']}"
     return " ".join(text.split())
+
+
+def table(title: str, scored: list[list[dict]], keep) -> None:
+    """score.py's summary of both runs on the questions at ``keep`` (indices), per kind of question."""
+    print(f"\n{title}")
+    keep = list(keep)
+    if not keep:
+        print("  (none)")
+        return
+    tables = [summarize([rows[i] for i in keep]) for rows in scored]
+    width = max(len(k) for k in tables[0])
+    print(f"{'':{width}}  {'n':>3}  " + "  ".join(f"{label:^11}" for _, label in COLUMNS))
+    for key in tables[0]:
+        a, b = tables[0][key], tables[1][key]
+        print(f"{key:{width}}  {a['n']:>3}  " + "  ".join(f"{cell(a[c]):>5}→{cell(b[c]):<5}" for c, _ in COLUMNS))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,28 +100,34 @@ def main(argv: list[str] | None = None) -> int:
     for rows in scored:  # group by kind of question rather than question_type
         for q, r in zip(questions, rows):
             r["question_type"] = kind(q, gold[q["question_id"]])
-    tables = [summarize(rows) for rows in scored]
+    status = [statuses(args.a, questions), statuses(args.b, questions)]
+    both = [i for i, q in enumerate(questions) if all(s[q["question_id"]] == "answered" for s in status)]
 
-    width = max(len(k) for k in tables[0])
     print(f"\nA = {names[0]}, B = {names[1]}; each cell is A→B")
-    print(f"{'':{width}}  {'n':>3}  " + "  ".join(f"{label:^11}" for _, label in COLUMNS))
-    for key in tables[0]:
-        a, b = tables[0][key], tables[1][key]
-        print(f"{key:{width}}  {a['n']:>3}  " + "  ".join(f"{cell(a[c]):>5}→{cell(b[c]):<5}" for c, _ in COLUMNS))
+    table(f"All {len(questions)} questions", scored, range(len(questions)))
+    for name, s in zip(names, status):
+        lost = Counter(v for v in s.values() if v != "answered")
+        print(f"{name}: {sum(lost.values())} of {len(questions)} excluded"
+              + (" (" + ", ".join(f"{k} {v}" for k, v in lost.most_common()) + ")" if lost else ""))
+    table(f"Only the {len(both)} questions both runs answered (abstentions included)", scored, both)
 
     w = args.width
     print(f"\n{'question':<14}  {'kind':<12}  {'gold':<{w}}  {names[0]:<{w}}  {names[1]:<{w}}")
     changed = 0
     for i, q in enumerate(questions):
         g = gold[q["question_id"]]
-        cells = [shown(p.get(q["question_id"], {"abstain": True}), rows[i]) for p, rows in zip(preds, scored)]
-        flag = "" if scored[0][i]["answer"] == scored[1][i]["answer"] else "  *"
+        cells = [shown(p.get(q["question_id"], {"abstain": True}), rows[i], s[q["question_id"]])
+                 for p, rows, s in zip(preds, scored, status)]
+        same = (scored[0][i]["answer"] == scored[1][i]["answer"]
+                and status[0][q["question_id"]] == status[1][q["question_id"]])
+        flag = "" if same else "  *"
         changed += bool(flag)
         target = "(abstain)" if g["abstain"] else " ".join(g["answer"].split())
         print(f"{q['question_id']:<14}  {kind(q, g):<12.12}  {target[:w]:<{w}}  {cells[0][:w]:<{w}}  "
               f"{cells[1][:w]:<{w}}{flag}")
         print(f"{'':<14}  {q['question'][:110]}")
-    print(f"\n* {changed} question(s) scored differently. ✓ correct  ? unjudged  ✗ wrong  — abstained")
+    print(f"\n* {changed} question(s) scored or answered differently. ✓ correct  ? unjudged  ✗ wrong  — abstained  "
+          "! no answer")
     return 0
 
 

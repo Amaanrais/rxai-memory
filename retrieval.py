@@ -24,6 +24,16 @@ RELATIVE_TIME = re.compile(
     r"|(?:last|this past|earlier this|later this)\s+(?:week|weekend|month|year|night|summer|spring|fall|autumn|winter"
     r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", re.IGNORECASE)
 SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+# version 3: questions asking for a name, whose answer is often said in passing ("we took Biscuit to the vet")
+NAME_QUESTION = re.compile(r"\bnames? of\b|\bcalled\b|\bnamed\b|'s names?\b|\bnames? (?:did|do|does|is|was)\b"
+                           r"|\bwhat(?:'s| is| was| were) (?:the|my|our|his|her|their) names?\b")
+SYNONYMS = {"dog": "puppy pup pet", "son": "kid boy", "partner": "husband wife boyfriend girlfriend",
+            "toddler": "kid son daughter", "instructor": "teacher coach", "museum": "gallery",
+            "running group": "running club runners"}
+SYNONYM_WEIGHT = 0.6  # a synonym counts for this share of a question word
+NAME_BOOST = 1.5  # a chunk with a name-like word near an entity word scores this much more
+NAME_NEAR = 40  # characters between the entity word and the name
+NAME_LIKE = re.compile(r"\b[A-Z][a-z]+(?:[ -][A-Z][a-z]+)*\b")
 K1, B = 1.2, 0.75
 
 STOPWORDS = frozenset("""
@@ -106,16 +116,26 @@ class HistoryIndex:
         self.median_idf = idfs[len(idfs) // 2] if idfs else 0.0
         self.max_idf = math.log(1 + (n + 0.5) / 0.5)  # a word the history never uses
 
-    def rank_chunks(self, question: str) -> list[tuple[int, float]]:
-        """[(chunk index, BM25 score)] for every chunk matching a question term, best first."""
+    def rank_chunks(self, question: str, version: int = 1) -> list[tuple[int, float]]:
+        """[(chunk index, BM25 score)] for every chunk matching a question term, best first.
+
+        ``version=3``, for a name question (``is_name_question()``): synonyms of its entity words count too
+        (``SYNONYMS``, at ``SYNONYM_WEIGHT``), and a chunk with a name-like word near an entity word scores
+        ``NAME_BOOST`` times more."""
+        terms = query_terms(question, version)
         scores: dict[int, float] = defaultdict(float)
-        for term in set(tokenize(question)):
+        for term, weight in terms.items():
             idf = self.idf.get(term)
             if idf is None:
                 continue
             for ci, tf in self.postings[term]:
                 norm = K1 * (1 - B + B * self.lengths[ci] / self.avgdl)
-                scores[ci] += idf * tf * (K1 + 1) / (tf + norm)
+                scores[ci] += weight * idf * tf * (K1 + 1) / (tf + norm)
+        if version >= 3 and is_name_question(question):
+            entities = {t for t in terms if t not in NAME_FRAMING}
+            for ci in scores:
+                if names_near(self.chunk_text[ci], entities):
+                    scores[ci] *= NAME_BOOST
         return sorted(scores.items(), key=lambda s: -s[1])
 
     def _session_scores(self, ranked: list[tuple[int, float]]) -> list[tuple[int, float]]:
@@ -125,9 +145,9 @@ class HistoryIndex:
         scored = [(si, s[0] + 0.25 * sum(s[1:3])) for si, s in per_session.items()]
         return sorted(scored, key=lambda s: -s[1])
 
-    def search(self, question: str, k_sessions: int = 5) -> list[tuple[str, float]]:
+    def search(self, question: str, k_sessions: int = 5, version: int = 1) -> list[tuple[str, float]]:
         """The ``k_sessions`` best sessions: best chunk + 0.25 x the next two chunks of that session."""
-        scored = self._session_scores(self.rank_chunks(question))[:k_sessions]
+        scored = self._session_scores(self.rank_chunks(question, version))[:k_sessions]
         return [(self.sessions[si]["session_id"], score) for si, score in scored]
 
     def suggest_citations(self, question: str, ratio: float = 0.6, multi_k: int = 2, max_k: int = 5) -> list[str]:
@@ -159,13 +179,15 @@ class HistoryIndex:
         - ``lead``: when the top session clearly leads (the next scores under ``LEAD_RATIO`` x it, as in
           ``suggest_citations()``), it gets up to half the budget, and the others share the rest;
         - ``time_cues``: for an aggregate question (``is_aggregate()``), each excerpt adds its session's user
-          sentences that say when something happened ("last month", "three weeks ago"), wherever they are."""
+          sentences that say when something happened ("last month", "three weeks ago"), wherever they are.
+
+        ``version=3`` is version 2 with name questions ranked as ``rank_chunks()`` says and routed to 8 sessions."""
         lead = version >= 2 if lead is None else lead
         time_cues = version >= 2 if time_cues is None else time_cues
-        route_k, route_budget = route(question)
+        route_k, route_budget = route(question, version)
         budget = route_budget if budget is None else budget
         k_sessions = route_k if k_sessions is None else k_sessions
-        ranked = self.rank_chunks(question)
+        ranked = self.rank_chunks(question, version)
         top = self._session_scores(ranked)[:k_sessions]
         if not top:
             return []
@@ -179,7 +201,8 @@ class HistoryIndex:
                 turns[ti].append(ci)
             elif len(turns) < per_session_hits:
                 turns[ti] = [ci]
-        weights = {t: self.idf[t] for t in set(tokenize(question)) if t in self.idf} if version >= 2 else None
+        weights = ({t: w * self.idf[t] for t, w in query_terms(question, version).items() if t in self.idf}
+                   if version >= 2 else None)
         cues = time_cues and is_aggregate(question)
         chronological = sorted(top)  # session order is chronological
         latest = chronological[-1][0]
@@ -292,9 +315,49 @@ def is_aggregate(question: str) -> bool:
     return bool(AGGREGATE.search(question.lower()))
 
 
-def route(question: str) -> tuple[int, int]:
-    """(k_sessions, budget): 8 sessions in 24,000 characters for aggregate questions, else 5 in 12,000."""
-    return (8, 24000) if is_aggregate(question) else (5, 12000)
+def route(question: str, version: int = 1) -> tuple[int, int]:
+    """(k_sessions, budget): 8 sessions in 24,000 characters for aggregate questions (and from version 3, name
+    questions), else 5 in 12,000."""
+    wide = is_aggregate(question) or (version >= 3 and is_name_question(question))
+    return (8, 24000) if wide else (5, 12000)
+
+
+def is_name_question(question: str) -> bool:
+    """A question asking for the name of something: "What's my dog's name?", "the café you recommended called"."""
+    return bool(NAME_QUESTION.search(question.lower()))
+
+
+NAME_FRAMING = frozenset(tokenize("name names named called call recommend recommended"))
+NOT_NAMES = STOPWORDS | frozenset("""january february march april may june july august september october november
+december monday tuesday wednesday thursday friday saturday sunday user assistant""".split())
+
+
+def query_terms(question: str, version: int = 1) -> dict[str, float]:
+    """The question's terms with their weights: 1 each, plus from version 3 the ``SYNONYMS`` of a name question's
+    entity words at ``SYNONYM_WEIGHT``."""
+    terms = dict.fromkeys(set(tokenize(question)), 1.0)
+    if version >= 3 and is_name_question(question):
+        q = question.lower()
+        for entity, synonyms in SYNONYMS.items():
+            if re.search(rf"\b{entity}s?\b", q):
+                for term in tokenize(synonyms):
+                    terms.setdefault(term, SYNONYM_WEIGHT)
+    return terms
+
+
+def names_near(text: str, entities: set[str]) -> bool:
+    """Whether ``text`` has a name-like word (capitalised, not starting a sentence, not a month or weekday) within
+    ``NAME_NEAR`` characters of a word whose stem is in ``entities``."""
+    spots = [m.start() for m in TOKEN.finditer(text.lower()) if stem(m.group()) in entities]
+    if not spots:
+        return False
+    for m in NAME_LIKE.finditer(text):
+        before = text[:m.start()].rstrip()
+        if not before or before[-1] in ".!?:\n\"(" or m.group().split()[0].lower() in NOT_NAMES:
+            continue
+        if any(abs(m.start() - spot) <= NAME_NEAR for spot in spots):
+            return True
+    return False
 
 
 def parse_date(value: str) -> date:

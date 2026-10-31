@@ -1,21 +1,24 @@
-"""Recall: find answers in months of chat history, with sources. A Streamlit demo of our solution.
+"""Recall: ask about anything you've told an assistant, across months of chat history. A Streamlit demo.
 
     streamlit run app.py --server.address localhost          # saved Reactor answers only: never calls Reactor
     REACTOR_LIVE=1 streamlit run app.py --server.address localhost
-        # adds an "Ask Reactor" button (REACTOR_BASE_URL, REACTOR_AGENT_ID, REACTOR_ACCESS_KEY from the environment;
-        # the key is never shown)
+        # adds a "Get a live answer" button (REACTOR_BASE_URL, REACTOR_AGENT_ID, REACTOR_ACCESS_KEY from the
+        # environment; the key is never shown)
 
-Answers come from the run files in the repo root: every results-*.jsonl with its <name>.evidence.jsonl, as written
-by run.py / run_v2.py. Retrieval runs live for any question, answered or not. The Results tab reads metrics/*.json
-(eval_retrieval.py --json) and scores the saved dev runs with score.py.
+Two pages: Chat (a chat-first start screen with suggestions, then the conversation; each reply opens its Sources
+and "How I answered" in a dialog) and About (for businesses, how it works, results). Answers come from the run
+files in the repo root: every results-*.jsonl with its <name>.evidence.jsonl, as written by run.py / run_v2.py.
+Retrieval runs live for any question. Advanced settings sit in the collapsed sidebar.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +26,7 @@ from types import SimpleNamespace
 import streamlit as st
 
 from make_predictions import choose, predict
-from retrieval import STOPWORDS, HistoryIndex, is_aggregate, stem, tokenize
+from retrieval import STOPWORDS, HistoryIndex, is_aggregate, is_name_question, stem, tokenize
 from score import score_question, summarize
 
 ROOT = Path(__file__).resolve().parent
@@ -41,148 +44,196 @@ MIN_TOP_SCORE = 6.0
 MIN_EVIDENCE_CHARS = 200
 SET_NAMES = {"dev": "practice set", "test": "test set"}
 
-# the four questions of the "Try these" row: dev questions with a saved answer, one per kind of question
-DEMOS = [("A fact the user mentioned", "q_4feb114c6944"),
-         ("A fact that changed", "q_92447a8c097c"),
-         ("A trap: the answer isn't there", "q_43824099a143"),
-         ("Something the assistant said", "q_14252c64d73d")]
+# the suggestions on the start screen: the user's own words, the dev question they stand for, whether it runs on v2
+CHIPS = [("What did I bake for my niece's party?", "q_4feb114c6944", False),
+         ("Where's the Ethereal Dreams painting now?", "q_415adf25cebc", False),
+         ("Where did I present my undergrad poster?", "q_43824099a143", True),  # the trap: v2 names missing words
+         ("What 2FA methods did you mention?", "q_14252c64d73d", False)]
+# a first name for each demo user (the histories are anonymous); other users get one from NAMES by their id
+PEOPLE = {"h_e6d0b8417122": "Alex", "h_805dae031df3": "Sam", "h_c2c3efa33e8e": "Priya", "h_2bbadf4a2bcd": "Jordan"}
+NAMES = ["Mateo", "Noor", "Lena", "Kofi", "Hana", "Ravi", "Zoe", "Elif", "Tomás", "Aiko", "Femi", "Ines"]
 
-st.set_page_config(page_title="Recall", page_icon="🔎", layout="centered", initial_sidebar_state="collapsed")
+# the mark: a speech bubble with a highlighter stroke, the browser tab's icon
+MARK_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="#0e5a5f"/>'
+            '<path d="M11 13.5a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v8.5a3 3 0 0 1-3 3h-7.2l-4.6 3.8v-3.8H14a3 3 0 0 1-3-3z" '
+            'fill="#fff"/><rect x="14.5" y="15.2" width="11" height="3.4" rx="1.2" fill="#ffe68a"/>'
+            '<rect x="14.5" y="19.6" width="7" height="1.6" rx="0.8" fill="#9fb9ba"/></svg>')
+# the browser tab's icon
+MARK_URL = "data:image/svg+xml;base64," + __import__("base64").b64encode(MARK_SVG.encode()).decode()
+# the wordmark: "Recall" in ink with a teal full stop
+WORDMARK = 'Recall<span class="dot">.</span>'
+
+st.set_page_config(page_title="Recall", page_icon=MARK_URL, layout="centered",
+                   initial_sidebar_state="collapsed")
 
 # ---------- style ----------
-# Framed sheet (taste-skill app style, seed 655928746): the page ground #f2f4f6, one white sheet with a 1px edge and
-# 16px corners, no shadows. One accent, teal, on the mark, the active tab, the efficiency bar, links and focus. The
-# highlighter is only ever on cited text.
+# The Apple design analysis (DESIGN.md): the system font stack, 17px body, weights 400 and 600, tight tracking on
+# display sizes, one accent for every action (our teal in place of Action Blue), no shadows on cards or buttons,
+# pills for actions and inputs, scale(0.97) on press, a frosted bar for what floats. The brief adds one very soft
+# teal gradient pooled at the bottom of the start screen. The highlighter marks cited text in Sources only.
 st.html("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&display=swap');
 :root {
-  --ground: #f2f4f6; --surface: #ffffff; --raised: #f7f8fa; --active: #e9edf1;
-  --border: #e3e7eb; --rule: #edf0f3; --control: #cbd2d9;
-  --ink: #1c2430; --muted: #5e6876; --accent: #0e5a5f; --accent-soft: #e3eeee;
-  --mark: rgba(255, 230, 138, 0.6); --notice-bg: #f6f2e3; --notice-ink: #5c4a12;
-  --font: "Schibsted Grotesk", system-ui, sans-serif;
+  --canvas: #f7f8f8; --surface: #ffffff; --ink: #1d1d1f; --muted: #5f6670; --faint: #6e747c;
+  --hairline: rgba(0, 0, 0, 0.08); --accent: #0e5a5f; --accent-soft: #e2eeee; --accent-ring: #1b7a80;
+  --mark: rgba(255, 230, 138, 0.6); --notice-bg: #f5f1e1; --notice-ink: #5c4a12;
+  --font: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
 }
-html, body, .stApp, .stApp * { font-family: var(--font); }
-[data-testid="stIconMaterial"], .material-symbols-rounded { font-family: "Material Symbols Rounded" !important; }
-.stApp { background: var(--ground); color: var(--ink); }
+html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]):not(.material-symbols-rounded),
+[role="dialog"], [role="dialog"] *:not([data-testid="stIconMaterial"]) { font-family: var(--font); }
+[role="dialog"] h2 { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; }
+.stApp { color: var(--ink); background:
+  radial-gradient(60% 50% at 50% 110%, rgba(14, 90, 95, 0.17), transparent 70%),
+  radial-gradient(42% 40% at 80% 104%, rgba(120, 196, 186, 0.22), transparent 70%),
+  radial-gradient(38% 34% at 22% 104%, rgba(176, 222, 214, 0.22), transparent 70%),
+  var(--canvas); background-attachment: fixed; }
 [data-testid="stHeader"] { background: transparent; }
 [data-testid="stToolbarActions"], [data-testid="stMainMenu"], [data-testid="stAppDeployButton"],
 .stDeployButton, footer, [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
-.block-container { max-width: 808px; padding: 40px 24px 96px; }
-[data-testid="stSidebar"] { background: var(--ground); border-right: 1px solid var(--border); }
-*:focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 2px; }
+.block-container { max-width: 760px; padding: 48px 24px 32px; }
+[data-testid="stSidebar"] { background: var(--canvas); border-right: 1px solid var(--hairline); }
+*:focus-visible { outline: 2px solid var(--accent-ring) !important; outline-offset: 2px; }
+p, li { font-size: 17px; line-height: 1.47; }
 
-/* header */
-.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin: 0 0 4px; }
-.brand .word { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; color: var(--ink); }
-.brand .word b { color: var(--accent); font-weight: 700; }
-.brand .line { font-size: 15px; color: var(--muted); }
-.try { font-size: 14px; color: var(--muted); margin: 22px 0 8px; }
+/* the wordmark: small and fixed in the top-left corner on every screen, large over the start screen's title */
+.st-key-brand { position: fixed; top: 17px; left: 22px; width: auto; z-index: 1000001; }
+[data-testid="stToolbar"] > div:first-child { padding-left: 82px; }  /* the sidebar arrow and pages after it */
+.wordmark { font-size: 20px; line-height: 1; font-weight: 700; letter-spacing: -0.02em; color: var(--accent); }
+.wordmark .dot { color: var(--accent-ring); }
+.hero .wordmark { font-size: 40px; letter-spacing: -0.03em; }
+.about-head { margin: 0 0 8px; }
+.about-head .wordmark { font-size: 40px; letter-spacing: -0.03em; }
+.about-head .line { font-size: 21px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; color: var(--muted);
+  margin-top: 6px; }
 
-/* buttons: quiet, white, 1px control edge; the chosen demo takes the neutral active fill */
-.stButton > button { background: var(--surface); color: var(--ink); border: 1px solid var(--control);
-  border-radius: 8px; min-height: 44px; font-size: 14px; font-weight: 500; line-height: 1.3;
-  padding: 8px 12px; box-shadow: none; text-align: left; justify-content: flex-start; }
-.stButton > button > div, .stButton > button > div > span { justify-content: flex-start; width: 100%; }
-.stButton > button:hover { border-color: var(--ink); color: var(--ink); background: var(--surface); }
-.stButton > button[kind="primary"], [data-testid="stBaseButton-primary"] { background: var(--active);
-  border-color: var(--ink); color: var(--ink); }
-.stButton > button p, .stButton > button div { font-size: 14px; white-space: normal; overflow: visible;
-  text-overflow: clip; text-align: left; }
-[data-testid="stExpander"] details { border: none; background: transparent; }
-[data-testid="stExpander"] summary { padding-left: 0; color: var(--muted); font-size: 14px; }
-[data-testid="stExpander"] summary:hover { color: var(--ink); }
+/* the start screen */
+.hero { display: flex; flex-direction: column; align-items: center; text-align: center; padding-top: 14vh; }
+.hero h1 { font-size: 30px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; color: var(--ink);
+  margin: 14px 0 0; padding: 0; text-wrap: balance; }
+.st-key-who { margin-top: -6px; }
+.st-key-who button p, .st-key-whochat button p { font-size: 15px; color: var(--muted); }
+.st-key-who button:hover p, .st-key-whochat button:hover p { color: var(--accent); }
+.suggest { font-size: 14px; color: var(--muted); margin: 0 0 8px 2px; }
 
-/* the sheet */
-.st-key-sheet { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-  padding: 32px 32px 24px; margin-top: 12px; }
-h1.question { font-size: 30px; line-height: 1.2; font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
-  margin: 0; padding: 0; }
-.meta { font-size: 15px; color: var(--muted); margin-top: 8px; }
-.answer-label { font-size: 14px; color: var(--muted); margin-top: 28px; }
-.answer { font-size: 40px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; color: var(--ink);
-  margin-top: 6px; overflow-wrap: anywhere; }
-.answer.long { font-size: 28px; line-height: 1.25; }
-.answer.calm { font-size: 22px; line-height: 1.35; font-weight: 500; letter-spacing: 0; color: var(--ink); }
-.pending { font-size: 15px; color: var(--muted); margin-top: 24px; }
-.scope { font-size: 14px; color: var(--muted); margin-bottom: 10px; }
-.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-.chip { font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 999px;
-  padding: 4px 11px; text-decoration: none; white-space: nowrap; }
-.chip:hover { text-decoration: underline; }
-.status { font-size: 16px; color: var(--ink); margin-top: 16px; }
-.status .why { color: var(--muted); }
-.efficiency { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 15px;
-  color: var(--muted); }
-.efficiency b { color: var(--ink); font-weight: 600; }
-.bar { height: 4px; background: var(--rule); border-radius: 2px; margin-top: 10px; overflow: hidden; }
-.bar span { display: block; height: 4px; background: var(--accent); border-radius: 2px; min-width: 3px; }
+/* the bottom bar: suggestions over a pill input, on frosted glass so the conversation scrolls under it */
+[data-testid="stBottom"] > div, [data-testid="stBottomBlockContainer"] { background: transparent; }
+[data-testid="stBottomBlockContainer"] { max-width: 760px; padding-bottom: 28px; }
+[data-testid="stBottom"] { background: rgba(247, 248, 248, 0.55); -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px); }
+.st-key-chips .stButton > button { background: rgba(255, 255, 255, 0.78); border: 1px solid var(--hairline);
+  border-radius: 12px; min-height: 94px; padding: 12px 14px; box-shadow: none; color: var(--ink);
+  justify-content: flex-start; align-items: flex-start; text-align: left; transition: transform 120ms ease; }
+.st-key-chips .stButton > button > div, .st-key-chips .stButton > button > div > span { justify-content: flex-start;
+  width: 100%; }
+.st-key-chips .stButton > button p { font-size: 14px; line-height: 1.35; white-space: normal; text-align: left; }
+.st-key-chips .stButton > button:hover { border-color: var(--accent); color: var(--ink); background: #fff; }
+.stButton > button:active { transform: scale(0.97); }
+[data-testid="stChatInput"] { border-radius: 9999px; border: 1px solid var(--hairline); background: var(--surface);
+  box-shadow: none; padding: 4px 6px 4px 14px; }
+[data-testid="stChatInput"] > div { border: none !important; border-radius: 9999px; background: transparent; }
+[data-testid="stChatInputSubmitButton"] { border-radius: 9999px; }
+[data-testid="stChatInput"]:focus-within { border-color: var(--accent); }
+[data-testid="stChatInput"] textarea { font-size: 17px; padding-left: 8px; }
+[data-testid="stChatInputSubmitButton"] { color: var(--accent); }
 
-/* tabs: a 2px teal underline on a 1px rule */
-.stTabs [data-baseweb="tab-list"] { gap: 24px; border-bottom: 1px solid var(--border); margin-top: 20px; }
-.stTabs [data-baseweb="tab"] { padding: 10px 0; font-size: 15px; color: var(--muted); }
-.stTabs [data-baseweb="tab"] p { font-size: 15px; }
-.stTabs [aria-selected="true"] { color: var(--ink); }
-.stTabs [data-baseweb="tab-highlight"] { background: var(--accent); height: 2px; }
-.stTabs [data-baseweb="tab-border"] { display: none; }
+/* the conversation */
+[data-testid="stChatMessage"] { background: transparent; padding: 6px 0; gap: 12px; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { flex-direction: row-reverse; }
+[data-testid="stChatMessageAvatarUser"] { display: none; }
+[data-testid="stChatMessageAvatarCustom"], [data-testid="stChatMessageAvatarAssistant"] {
+  background: var(--accent-soft); color: var(--accent); border-radius: 9999px; }
+.you { margin-left: auto; width: fit-content; max-width: 80%; background: var(--accent); color: #fff;
+  border-radius: 20px 20px 6px 20px; padding: 10px 16px; font-size: 17px; line-height: 1.4; }
+.reply { font-size: 17px; line-height: 1.47; color: var(--ink); }
+.reply .answer { font-size: 22px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; }
+.reply .quiet { color: var(--muted); }
+.reply .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.reply .chip { font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 9999px;
+  padding: 4px 11px; white-space: nowrap; }
+.typing { display: inline-flex; gap: 5px; padding: 10px 2px; }
+.typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); opacity: 0.35;
+  animation: blink 1s infinite ease-in-out; }
+.typing span:nth-child(2) { animation-delay: 0.15s; } .typing span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes blink { 50% { opacity: 1; } }
+.fresh { animation: rise 250ms ease-out both; }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+[class*="st-key-act-"] .stButton > button { padding: 2px 0; min-height: 0; }
+[class*="st-key-act-"] .stButton > button p { font-size: 15px; color: var(--accent); }
+[class*="st-key-act-"] { gap: 18px; }
+.whochat { font-size: 14px; color: var(--muted); text-align: center; }
 
-/* sources */
-.sources-intro { font-size: 14px; color: var(--muted); margin: 4px 0 12px; }
-.hint { background: var(--notice-bg); color: var(--notice-ink); border-radius: 10px; padding: 12px 14px;
-  font-size: 15px; line-height: 1.5; margin-bottom: 12px; }
-details.src { border-top: 1px solid var(--rule); padding: 14px 0; }
-details.src:last-of-type { border-bottom: 1px solid var(--rule); }
+/* dialogs */
+[role="dialog"] { border-radius: 18px; animation: rise 220ms ease-out both; }
+.sources-intro { font-size: 15px; color: var(--muted); margin: 0 0 10px; }
+.hint { background: var(--notice-bg); color: var(--notice-ink); border-radius: 12px; padding: 12px 14px;
+  font-size: 15px; line-height: 1.5; margin: 12px 0; }
+details.src { border-top: 1px solid var(--hairline); padding: 14px 0; }
+details.src:last-of-type { border-bottom: 1px solid var(--hairline); }
 details.src summary { list-style: none; cursor: pointer; border-radius: 6px; }
 details.src summary::-webkit-details-marker { display: none; }
 .src .when { font-size: 15px; font-weight: 600; color: var(--ink); }
 .src .when .ago { font-weight: 400; color: var(--muted); }
-.src .when .tag { font-weight: 500; color: var(--accent); margin-left: 6px; }
+.src .when .tag { font-weight: 400; color: var(--accent); margin-left: 6px; }
 .src .snippet { font-size: 15px; line-height: 1.5; color: var(--ink); margin-top: 4px; }
 .src .snippet .open { color: var(--muted); font-size: 14px; margin-left: 6px; white-space: nowrap; }
 details.src[open] .open { display: none; }
-.src .turns { margin-top: 14px; padding: 16px 18px; background: var(--raised); border-radius: 10px;
-  max-height: 460px; overflow-y: auto; }
-.src .turn { margin-bottom: 14px; }
-.src .turn:last-child { margin-bottom: 0; }
+.src .turns { margin-top: 12px; padding: 14px 16px; background: #f5f5f7; border-radius: 12px; max-height: 380px;
+  overflow-y: auto; }
+.src .turn { margin-bottom: 12px; } .src .turn:last-child { margin-bottom: 0; }
 .src .who { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 2px; }
-.src .said { font-size: 15px; line-height: 1.55; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
-.src .gap { color: var(--muted); font-size: 14px; margin-bottom: 14px; }
+.src .said { font-size: 15px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.src .gap { color: var(--muted); font-size: 14px; margin-bottom: 12px; }
 mark.hl { background: var(--mark); color: inherit; padding: 0 2px; border-radius: 2px;
   -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.how { font-size: 16px; line-height: 1.5; }
+.how h4 { font-size: 15px; font-weight: 600; margin: 18px 0 4px; padding: 0; }
+.how h4:first-child { margin-top: 0; }
+.how .big { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.how .muted { color: var(--muted); }
+.bar { height: 4px; background: rgba(0, 0, 0, 0.06); border-radius: 2px; margin: 8px 0 2px; overflow: hidden; }
+.bar span { display: block; height: 4px; background: var(--accent); border-radius: 2px; min-width: 3px; }
 
-/* how it works, results */
-.prose { font-size: 16px; line-height: 1.6; color: var(--ink); }
-.prose h3 { font-size: 18px; font-weight: 600; margin: 22px 0 6px; }
-.prose ol, .prose ul { padding-left: 22px; margin: 0; }
-.prose li { margin-bottom: 8px; }
-.prose li::marker { font-variant-numeric: normal; }
+/* About */
+.prose { font-size: 17px; line-height: 1.47; color: var(--ink); }
+.prose h2 { font-size: 30px; font-weight: 600; letter-spacing: -0.02em; margin: 8px 0 6px; padding: 0; }
+.prose h3 { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; margin: 26px 0 6px; padding: 0; }
+.prose ol, .prose ul { padding-left: 22px; margin: 0; } .prose li { margin-bottom: 8px; }
 .prose .muted { color: var(--muted); }
-table.t { border-collapse: collapse; width: 100%; font-size: 14px; margin: 6px 0 4px; }
-table.t td { font-variant-numeric: tabular-nums; }
-table.t td:first-child { font-variant-numeric: normal; }
+.values { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+.value { background: var(--surface); border: 1px solid var(--hairline); border-radius: 18px; padding: 20px 22px; }
+.value .num { font-size: 34px; font-weight: 600; letter-spacing: -0.02em; color: var(--accent); line-height: 1.1; }
+.value .what { font-size: 17px; font-weight: 600; margin-top: 6px; }
+.value .how { font-size: 15px; color: var(--muted); margin-top: 4px; }
+table.t { border-collapse: collapse; width: 100%; font-size: 15px; margin: 6px 0 4px; }
 table.t, table.t th, table.t td { font-family: var(--font) !important; }
 table.t th { font-weight: 400; color: var(--muted); text-align: right; padding: 6px 8px;
-  border-bottom: 1px solid var(--border); white-space: nowrap; }
-table.t td { padding: 7px 8px; text-align: right; border-bottom: 1px solid var(--rule); }
-table.t th:first-child, table.t td:first-child { text-align: left; padding-left: 0; width: 34%; }
+  border-bottom: 1px solid rgba(0, 0, 0, 0.12); white-space: nowrap; }
+table.t td { padding: 8px; text-align: right; border-bottom: 1px solid var(--hairline);
+  font-variant-numeric: tabular-nums; }
+table.t th:first-child, table.t td:first-child { text-align: left; padding-left: 0; width: 34%;
+  font-variant-numeric: normal; }
 table.t tr.all td { font-weight: 600; }
 .tcap { font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+.stTabs [data-baseweb="tab-list"] { gap: 24px; border-bottom: 1px solid var(--hairline); }
+.stTabs [data-baseweb="tab"] { padding: 10px 0; } .stTabs [data-baseweb="tab"] p { font-size: 15px; }
+.stTabs [data-baseweb="tab-highlight"] { background: var(--accent); height: 2px; }
+.stTabs [data-baseweb="tab-border"] { display: none; }
+.adv dt { font-size: 13px; color: var(--muted); margin-top: 10px; } .adv { margin: 0; padding: 0; }
+.adv dd { font-size: 14px; margin: 2px 0 0; overflow-wrap: anywhere; }
 
-/* sidebar details */
-.adv { margin: 0; padding: 0; }
-.adv dt { font-size: 13px; color: var(--muted); margin-top: 10px; }
-.adv dd { font-size: 14px; color: var(--ink); margin: 2px 0 0; overflow-wrap: anywhere; }
 @media (max-width: 640px) {
-  .block-container { padding: 64px 16px 64px; }
-  .st-key-sheet { padding: 22px 18px 18px; border-radius: 12px; }
-  h1.question { font-size: 24px; }
-  .answer { font-size: 30px; }
-  .answer.long { font-size: 22px; }
+  .block-container { padding: 24px 16px 16px; }
+  .hero { padding-top: 6vh; } .hero h1 { font-size: 24px; } .values { grid-template-columns: 1fr; }
+  .st-key-chips [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: 8px; }
+  .st-key-chips [data-testid="stColumn"] { flex: 1 1 calc(50% - 8px) !important; min-width: calc(50% - 8px) !important; }
+  .st-key-chips .stButton > button { min-height: 72px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fresh, [role="dialog"], .typing span { animation: none !important; }
+  .stButton > button:active { transform: none; }
 }
 </style>
 """)
-
 
 # ---------- data ----------
 
@@ -382,204 +433,359 @@ def ask_reactor(split: str, history_id: str, qid: str, question: str, question_d
         return client(args, *extra)
 
 
-# ---------- sidebar: Advanced ----------
+
+
+# ---------- people and turns ----------
+
+def person(history_id: str) -> str:
+    """A first name for an anonymous history: the demo users have fixed ones, the rest one from NAMES by id."""
+    if history_id in PEOPLE:
+        return PEOPLE[history_id]
+    return NAMES[int(hashlib.sha1(history_id.encode()).hexdigest(), 16) % len(NAMES)]
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
 
 st.sidebar.markdown("### Advanced")
 split = st.sidebar.radio("Dataset", list(SPLITS), horizontal=True,
-                         help="dev has expected answers; test is the scored set, with none released")
+                         help="dev is the practice set, with expected answers; test is the scored set")
 version = 1 if st.sidebar.radio("Retrieval version", ["v1", "v2"], horizontal=True,
                                 help="v1 produced the submitted answers. v2 adds focused trimming, more room for a "
-                                     "leading conversation, time sentences and the missing-words note.") == "v1" else 2
+                                     "leading conversation, time sentences and the missing-words note. The trap "
+                                     "suggestion always uses v2.") == "v1" else 2
 live_ready = LIVE and all(os.environ.get(k) for k in LIVE_ENV)
-details_slot = st.sidebar.container()
-st.sidebar.markdown("#### Live mode")
+st.sidebar.markdown("#### Live answers")
 if live_ready:
     st.sidebar.write("On. Asking starts a new Reactor history on this agent, which interrupts a benchmark running "
                      "on it.")
 elif LIVE:
     st.sidebar.write("Not configured: set " + ", ".join(k for k in LIVE_ENV if not os.environ.get(k)) + ".")
 else:
-    st.sidebar.write("Off. Answers shown are the ones saved from our runs. Start with REACTOR_LIVE=1 to ask Reactor.")
+    st.sidebar.write("Off. Replies come from our saved runs. Start the app with REACTOR_LIVE=1 to ask Reactor.")
 
 questions = load_questions(split)
 by_id = {q["question_id"]: q for q in questions}
-gold = load_gold(split)
 runs = load_runs()
-
-# ---------- header and question picker ----------
-
-st.html('<div class="brand"><span class="word">Recall<b>.</b></span>'
-        '<span class="line">Find answers in months of chat history, with sources.</span></div>')
-
 state = st.session_state
-if state.get("split") != split:  # a new dataset starts on its first demo, or its first answered question
-    state.split = split
-    first = next((qid for _, qid in DEMOS if qid in by_id), None)
-    state.qid = first or next((q["question_id"] for q in questions if q["question_id"] in runs),
-                              questions[0]["question_id"])
-    state.own = False
-
-def show_question(qid: str) -> None:
-    state.qid, state.own = qid, False
+if state.get("split") != split:  # a new dataset starts a new chat, as the first demo user
+    state.split, state.turns, state.animate = split, [], None
+    first = next((qid for _, qid, _ in CHIPS if qid in by_id), None)
+    state.history = by_id[first]["history_id"] if first else questions[0]["history_id"]
 
 
-def ask_own() -> None:
-    state.own, state.own_text, state.own_day = True, state.own_input.strip(), state.own_date
+def user_questions(history_id: str) -> list[dict]:
+    return [q for q in questions if q["history_id"] == history_id]
 
 
-demos = [(name, qid) for name, qid in DEMOS if qid in by_id]
-if demos:
-    st.html('<div class="try">Try these</div>')
-    cols = st.columns(len(demos))
-    for col, (name, qid) in zip(cols, demos):
-        chosen = not state.own and state.qid == qid
-        col.button(name, key=f"demo-{qid}", type="primary" if chosen else "secondary", width="stretch",
-                   on_click=show_question, args=(qid,))
-
-with st.expander("Browse all questions or ask your own"):
-    answered_only = st.toggle("Only questions with a saved answer", value=True)
-    pool = [q for q in questions if not answered_only or q["question_id"] in runs] or questions
-    ids = [q["question_id"] for q in pool]
-    if state.qid in ids:
-        state.browse = state.qid  # the list follows the question on screen, whichever control chose it
-    elif state.get("browse") not in ids:
-        state.browse = ids[0]
-    st.selectbox("Question", ids, key="browse", format_func=lambda qid: by_id[qid]["question"],
-                 on_change=lambda: show_question(state.browse))
-    st.write("")
-    st.text_input("Ask your own question about the same history", key="own_input",
-                  placeholder="e.g. Where did I go on my last trip?")
-    st.date_input("As if asked on", key="own_date", value=date_of(by_id[state.qid]["question_date"]).date())
-    st.button("Ask", disabled=not state.get("own_input", "").strip(), on_click=ask_own)
-
-base = by_id[state.qid]
-if state.own:
-    question_text = state.own_text
-    d = state.own_day
-    question_date = f"{d:%Y/%m/%d} ({d:%a}) {base['question_date'][-5:]}"
-    qid = "q_custom"
-else:
-    question_text, question_date, qid = base["question"], base["question_date"], base["question_id"]
-
-index, history_chars, n_sessions = load_index(split, base["history_id"])
-run = None if state.own else next((r for r in reversed(runs.get(qid, [])) if r["version"] == version), None)
-live_key = (split, base["history_id"], question_text, question_date, version)
-live_result = state.get("live", {}).get(live_key)
-if run and run["logged"]:
-    evidence = run["logged"]["evidence"]
-    missing = run["logged"].get("missing") or (index.missing_words(question_text, evidence) if version == 2 else [])
-else:
-    evidence = index.evidence(question_text, question_date=question_date, version=version)
-    missing = index.missing_words(question_text, evidence) if version == 2 else []
-g = None if state.own else gold.get(qid)
-result = live_result or (run["result"] if run else None)
-prediction = predict(qid, result, {"evidence": evidence})[0] if result else None
-cite_source = predict(qid, result, {"evidence": evidence})[1] if result else "-"
-cited = set(prediction["citations"]) if prediction else set()
-dates = {e["id"]: e["date"] for e in evidence}
-evidence_chars = sum(len(e["text"]) for e in evidence)
-sent_chars = evidence_chars + len(question_text)
-top = index.search(question_text, k_sessions=1)
-# nothing relevant: no excerpts, a weak best match, or almost no text to send
-no_evidence = not evidence or (top[0][1] if top else 0.0) < MIN_TOP_SCORE or evidence_chars < MIN_EVIDENCE_CHARS
-words = keywords(question_text)
-
-# ---------- the sheet ----------
-
-with st.container(key="sheet"):
-    who = "one user's chat history" + (" (the same user as the selected question)" if state.own else "")
-    st.html(f'<div class="scope">Searching {who}: {n_sessions} conversations, {SET_NAMES[split]}</div>'
-            f'<h1 class="question">{html.escape(question_text)}</h1>'
-            f'<div class="meta">Asked {day(question_date)}</div>')
-
-    said = []  # the status, in plain words
-    label = '<div class="answer-label">Answer</div>'  # only over a real answer
-    if prediction is None and no_evidence:
-        label, answer_html = "", ('<div class="answer-label">Recall</div><div class="answer calm">Nothing in this '
-                                  'user\'s conversations mentions that. Recall would say it doesn\'t know.</div>')
-    elif prediction is None:
-        label, answer_html = "", ('<div class="pending">' + ("Not sent to Reactor yet. Ask Reactor below to send it."
-                                  if live_ready else "Not sent to Reactor yet (live mode is off). Here\'s what "
-                                  "Recall would send it.") + "</div>")
-    elif result.get("status") != "answered":
-        label, answer_html = "", '<div class="pending">Reactor didn\'t answer in time.</div>'
-        said.append('Recall treats this as "I don\'t know", with no sources.')
-    elif prediction["abstain"]:
-        answer_html = '<div class="answer">I don\'t know.</div>'
-        said.append("Not in the history, so Recall says it doesn\'t know.")
+def add_turn(text: str, qid: str | None = None, v2: bool = False) -> None:
+    """A question into the chat. A suggestion stands for its dataset question (and switches to that user); typed
+    text is matched to one of this user's dataset questions, or else asked as is, on this user's latest date."""
+    if qid is None:
+        match = next((q for q in user_questions(state.history)
+                      if q["question"].strip().lower() == text.strip().lower()), None)
+        qid = match["question_id"] if match else None
+    if qid:
+        q = by_id[qid]
+        state.history, question, date = q["history_id"], q["question"], q["question_date"]
     else:
-        text = prediction["answer"]
-        answer_html = f'<div class="answer{" long" if len(text) > 60 else ""}">{html.escape(text)}</div>'
-    if prediction is not None and g:
-        verdict = score_question(prediction, g)["answer"]
-        expected = html.escape("It isn't in the history." if g["abstain"] else g["answer"])
-        said.append({"correct": "Matches the expected answer.",
-                     "unjudged": f'Checked by the judge later. <span class="why">Expected: {expected}</span>',
-                     "wrong": f'Doesn\'t match. <span class="why">Expected: {expected}</span>'}[verdict])
-    status = f'<div class="status">{" ".join(said)}</div>' if said else ""
-    chips = "".join(f'<a class="chip" href="#src-{sid}">{day(dates[sid], year=False)} conversation</a>'
-                    for sid in sorted(cited, key=lambda s: date_of(dates[s])) if sid in dates)
-    efficiency = ""
-    if not no_evidence:  # a ratio only means something when real evidence was found
-        efficiency = (f'<div class="efficiency">Read <b>{short(sent_chars)}</b> of {short(history_chars)} '
-                      f'characters, {history_chars / sent_chars:.0f}× less than the full history.'
-                      f'<div class="bar" role="img" aria-label="{sent_chars / history_chars:.1%} of the history '
-                      f'read"><span style="width:{min(sent_chars / history_chars, 1):.2%}"></span></div></div>')
-    st.html(label + answer_html + (f'<div class="chips">{chips}</div>' if chips else "") + status + efficiency)
+        question = text
+        date = max((q["question_date"] for q in user_questions(state.history)), key=date_of)
+    state.turns.append({"text": text, "question": question, "qid": qid, "history": state.history, "date": date,
+                        "version": 2 if v2 else version, "split": split, "trap": v2})
+    state.animate = len(state.turns) - 1
 
-    if live_ready and prediction is None and not no_evidence and st.button("Ask Reactor"):
-        with st.spinner("Reactor is answering, usually within a minute..."):
-            answer = ask_reactor(split, base["history_id"], qid, question_text, question_date, version,
-                                 evidence, missing)
-        state.setdefault("live", {})[live_key] = answer
+
+def resolve(turn: dict) -> SimpleNamespace:
+    """Everything a reply needs: the saved (or live) answer, the evidence sent with it, and how much was read."""
+    index, history_chars, n_sessions = load_index(turn["split"], turn["history"])
+    qid, v = turn["qid"], turn["version"]
+    # a version 3 run counts for version 2 on any other than a name question: its evidence is version 2's
+    same = {v, 3} if v == 2 and not is_name_question(turn["question"]) else {v}
+    run = next((r for r in reversed(runs.get(qid, [])) if r["version"] in same), None) if qid else None
+    live_key = (turn["split"], turn["history"], turn["question"], turn["date"], v)
+    live_result = state.get("live", {}).get(live_key)
+    if run and run["logged"]:
+        evidence = run["logged"]["evidence"]
+        missing = run["logged"].get("missing") or (index.missing_words(turn["question"], evidence) if v == 2 else [])
+    else:
+        evidence = index.evidence(turn["question"], question_date=turn["date"], version=v)
+        missing = index.missing_words(turn["question"], evidence) if v == 2 else []
+    result = live_result or (run["result"] if run else None)
+    prediction, cite_source = predict(qid or "q_custom", result, {"evidence": evidence}) if result else (None, "")
+    evidence_chars = sum(len(e["text"]) for e in evidence)
+    top = index.search(turn["question"], k_sessions=1)
+    no_evidence = (not evidence or (top[0][1] if top else 0.0) < MIN_TOP_SCORE
+                   or evidence_chars < MIN_EVIDENCE_CHARS)
+    return SimpleNamespace(index=index, history_chars=history_chars, n_sessions=n_sessions, run=run,
+                           live_key=live_key, live=bool(live_result), evidence=evidence, missing=missing,
+                           result=result, prediction=prediction, cite_source=cite_source,
+                           cited=set(prediction["citations"]) if prediction else set(),
+                           sent_chars=evidence_chars + len(turn["question"]), no_evidence=no_evidence,
+                           gold=load_gold(turn["split"]).get(qid) if qid else None)
+
+
+def reply_html(r: SimpleNamespace) -> str:
+    """The reply in plain words: the answer and up to two sources, "I don't have that", or what Recall would do."""
+    p = r.prediction
+    if p is None and r.no_evidence:
+        return "<div>I don't have that in our past conversations.</div>"
+    if p is None:
+        n = len(r.evidence)
+        rest = " Get a live answer below." if live_ready else " Live answers are off right now."
+        return f'<div class="quiet">I\'d look in {plural(n, "past conversation")} for this.{rest}</div>'
+    if r.result.get("status") != "answered":
+        return "<div>I couldn't answer that in time, so I won't guess.</div>"
+    if p["abstain"]:
+        return "<div>I don't have that in our past conversations.</div>"
+    dates = {e["id"]: e["date"] for e in r.evidence}
+    sources = sorted((s for s in r.cited if s in dates), key=lambda s: date_of(dates[s]))
+    chips = "".join(f'<span class="chip">From our chat on {day(dates[s], year=False)}</span>' for s in sources[:2])
+    if len(sources) > 2:
+        chips += f'<span class="chip">and {plural(len(sources) - 2, "more")}</span>'.replace("mores", "more")
+    return f'<div class="answer">{html.escape(p["answer"])}</div>' + (f'<div class="chips">{chips}</div>' if chips
+                                                                       else "")
+
+
+def sources_html(turn: dict, r: SimpleNamespace) -> str:
+    """The conversations sent, oldest first: collapsed rows with a snippet, cited ones under the highlighter."""
+    words = keywords(turn["question"])
+    shown = [] if r.prediction is None and r.no_evidence else r.evidence
+    if not shown:
+        return '<div class="sources-intro">No past conversation matches this closely enough to send.</div>'
+    verb = "would send" if r.prediction is None else "sent"
+    parts = [f'<div class="sources-intro">{plural(len(shown), "conversation")} Recall {verb} to Reactor, oldest '
+             f'first.{" Highlighted: the ones the answer comes from." if r.cited else ""}</div>']
+    for e in shown:
+        days, recent, body = parse_excerpt(e["text"])
+        is_cited = e["id"] in r.cited
+        turns = turns_of(body)
+        snippet = best_sentence(" ".join(t for who, t in turns if who), words)
+        ago = ("the day of the question" if days == 0 else f"{plural(days, 'day')} before the question"
+               ) if days is not None else ""
+        tags = (' <span class="tag">cited</span>' if is_cited else "") + \
+               (' <span class="tag">most recent</span>' if recent else "")
+        line = clip_line(snippet)
+        line = f'<mark class="hl">{html.escape(line)}</mark>' if is_cited else html.escape(line)
+        inner = ""
+        for who, text in turns:
+            if not who:
+                inner += '<div class="gap">…</div>'
+                continue
+            said = highlighted(text, snippet) if is_cited else html.escape(text)
+            inner += f'<div class="turn"><div class="who">{html.escape(who)}:</div><div class="said">{said}</div></div>'
+        parts.append(f'<details class="src"><summary><div class="when">{day(e["date"])}'
+                     f'{", " + ago if ago else ""}{tags}</div><div class="snippet">{line}'
+                     f'<span class="open">Show conversation</span></div></summary>'
+                     f'<div class="turns">{inner}</div></details>')
+    return "".join(parts)
+
+
+CITE_WORDS = {
+    "answer labels": "Reactor named the passages it used on its answer line, so those conversations are the sources.",
+    "reasoning labels": "Reactor named the passages it used in its reasoning, so those conversations are the sources.",
+    "support (exact)": "Reactor named no passages, so Recall cited only the passages that contain its answer.",
+    "support (partial)": "Reactor named no passages, so Recall cited only the passages holding most of its answer's "
+                         "words.",
+    "support (unspecific)": "Reactor named no passages, and its answer appears in too many to single any out, so "
+                            "Recall cites none.",
+    "support (unsupported)": "Reactor named no passages and none contains its answer, so Recall cites none.",
+    "abstain": "No sources: Recall cites nothing when it says it doesn't know.",
+}
+
+
+def how_html(turn: dict, r: SimpleNamespace) -> str:
+    who = person(turn["history"])
+    out = ['<div class="how">']
+    out.append("<h4>What I read</h4>")
+    if r.no_evidence and r.prediction is None:
+        out.append(f"<div>{who} has {plural(r.n_sessions, 'past conversation')} in the {SET_NAMES[turn['split']]}. "
+                   f"Nothing in them matched closely enough, so nothing would be sent.</div>")
+    else:
+        share = r.sent_chars / r.history_chars
+        out.append(f'<div class="big">{short(r.sent_chars)} of {short(r.history_chars)} characters</div>'
+                   f'<div class="bar" role="img" aria-label="{share:.1%} of the history"><span style="width:'
+                   f'{min(share, 1):.2%}"></span></div>'
+                   f'<div class="muted">{r.history_chars / r.sent_chars:.0f}× less than {who}\'s whole history: '
+                   f'{plural(len(r.evidence), "passage")} from {plural(r.n_sessions, "past conversation")}, about '
+                   f'{r.sent_chars / 4:,.0f} tokens instead of {r.history_chars / 4:,.0f}.</div>')
+    if turn["qid"] and turn["text"].strip() != turn["question"].strip():
+        out.append(f"<h4>The question</h4><div>You asked “{html.escape(turn['text'])}”. I looked it up as "
+                   f"“{html.escape(turn['question'])}”, asked on {day(turn['date'])}.</div>")
+    out.append("<h4>Checking the sources</h4>")
+    if r.prediction is None:
+        out.append('<div class="muted">Nothing to check yet: this question hasn\'t been sent to Reactor.</div>')
+    else:
+        out.append(f"<div>{CITE_WORDS.get(r.cite_source, html.escape(r.cite_source))}</div>")
+    if r.missing:
+        out.append(f'<div class="hint">Words from the question that appear in none of these conversations: '
+                   f'<b>{html.escape(", ".join(r.missing))}</b>. Reactor is told to say it doesn\'t know if the '
+                   f'answer depends on them. This is how near-miss traps are caught.</div>')
+    if r.gold and r.prediction is not None:
+        verdict = score_question(r.prediction, r.gold)["answer"]
+        expected = "It isn't in the history." if r.gold["abstain"] else r.gold["answer"]
+        line = {"correct": "matches it.", "unjudged": "isn't an exact match, so the official judge decides.",
+                "wrong": "doesn't match it."}[verdict]
+        out.append(f"<h4>Expected answer</h4><div>{html.escape(expected)} <span class=\"muted\">The reply "
+                   f"{line}</span></div>")
+    meta = [f"retrieval v{turn['version']}" + (" (used automatically for this trap question)" if turn["trap"]
+                                                else "")]
+    if r.result and r.result.get("latency_s") is not None:
+        meta.append(f"Reactor took {r.result['latency_s']:.0f} s")
+    meta.append("a live answer" if r.live else ("saved from our run" if r.run else "not sent"))
+    out.append(f'<h4>Details</h4><div class="muted">{html.escape(", ".join(meta)).capitalize()}.</div></div>')
+    return "".join(out)
+
+
+@st.dialog("Sources", width="large")
+def sources_dialog(i: int) -> None:
+    turn = state.turns[i]
+    st.html(sources_html(turn, resolve(turn)))
+
+
+@st.dialog("How I answered", width="large")
+def how_dialog(i: int) -> None:
+    turn = state.turns[i]
+    st.html(how_html(turn, resolve(turn)))
+
+
+@st.dialog("Switch user")
+def switch_dialog() -> None:
+    """Choose whose history to chat with: the demo users first, then everyone with a saved answer, then the rest."""
+    order = list(dict.fromkeys([h for h in PEOPLE if any(q["history_id"] == h for q in questions)]
+                               + [q["history_id"] for q in questions if q["question_id"] in runs]
+                               + [q["history_id"] for q in questions]))
+    first_q = {}
+    for q in questions:
+        first_q.setdefault(q["history_id"], q["question"])
+    choice = st.selectbox("Who are you chatting as?", order, index=order.index(state.history),
+                          format_func=lambda h: f"{person(h)}, who once asked “{first_q[h][:70]}”")
+    if st.button("Switch", type="primary"):
+        state.history, state.turns, state.animate = choice, [], None
         st.rerun()
 
-    sources_tab, how_tab, results_tab = st.tabs(["Sources", "How it works", "Results"])
 
-    with sources_tab:
-        shown_evidence = [] if prediction is None and no_evidence else evidence
-        if not shown_evidence:
-            intro = "No conversation matches the question closely enough to send to Reactor."
-        else:
-            intro = (f"{len(evidence)} conversations Recall {'would send' if prediction is None else 'sent'} to "
-                     f"Reactor, oldest first." + (" Highlighted: the ones the answer cites." if cited else ""))
-        parts = [f'<div class="sources-intro">{intro}</div>']
-        if missing and shown_evidence:
-            parts.append(f'<div class="hint">These words from the question appear nowhere in these conversations: '
-                         f'<b>{html.escape(", ".join(missing))}</b>. If the answer depends on them, Reactor is told '
-                         f'to say it doesn\'t know. This is how near-miss traps are caught.</div>')
-        for e in shown_evidence:
-            days, recent, body = parse_excerpt(e["text"])
-            is_cited = e["id"] in cited
-            turns = turns_of(body)
-            spoken = " ".join(t for who, t in turns if who)
-            snippet = best_sentence(spoken, words)
-            ago = ("on the day of the question" if days == 0 else f"{days} day{'' if days == 1 else 's'} "
-                   "before the question") if days is not None else ""
-            tags = (' <span class="tag">cited</span>' if is_cited else "") + \
-                   (' <span class="tag">most recent</span>' if recent else "")
-            one_line = clip_line(snippet)
-            shown = f'<mark class="hl">{html.escape(one_line)}</mark>' if is_cited else html.escape(one_line)
-            inner = ""
-            for who, text in turns:
-                if not who:
-                    inner += '<div class="gap">…</div>'
-                    continue
-                said = highlighted(text, snippet) if is_cited else html.escape(text)
-                inner += f'<div class="turn"><div class="who">{html.escape(who)}:</div><div class="said">{said}</div></div>'
-            parts.append(f'<details class="src" id="src-{html.escape(e["id"])}"><summary>'
-                         f'<div class="when">{day(e["date"])}{", " + ago if ago else ""}'
-                         f'{tags}</div>'
-                         f'<div class="snippet">{shown}<span class="open">Show conversation</span></div>'
-                         f'</summary><div class="turns">{inner}</div></details>')
-        st.html("".join(parts))
+def ask_chip(text: str, qid: str, v2: bool) -> None:
+    add_turn(text, qid, v2)
 
-    with how_tab:
+
+def new_chat() -> None:
+    state.turns, state.animate = [], None
+
+
+# ---------- pages ----------
+
+def chat_page() -> None:
+    bottom = getattr(st, "bottom", None) or getattr(st, "_bottom", None)  # the chat input's bar: chips go above it
+    with bottom if bottom is not None else st.container():
+        chips_slot = st.empty()
+    prompt = st.chat_input("Ask anything you've told me")
+    if prompt and prompt.strip():
+        add_turn(prompt.strip())
+
+    _, _, n_sessions = load_index(split, state.history)
+    who_line = f"Chatting as {person(state.history)} · {plural(n_sessions, 'past conversation')}"
+
+    if not state.turns:
+        chips = [c for c in CHIPS if c[1] in by_id] or [
+            (q["question"], q["question_id"], False) for q in user_questions(state.history)[:4]]
+        with chips_slot.container():
+            st.html('<div class="suggest">Try asking</div>')
+            with st.container(key="chips"):
+                for col, (text, qid, v2) in zip(st.columns(len(chips)), chips):
+                    col.button(text, key=f"chip-{qid}", width="stretch", on_click=ask_chip, args=(text, qid, v2))
+        st.html(f'<div class="hero"><div class="wordmark">{WORDMARK}</div>'
+                '<h1>Ask about anything you\'ve told me.</h1></div>')
+        with st.container(key="who", horizontal=True, horizontal_alignment="center"):
+            if st.button(who_line, type="tertiary", help="Switch to another user's chat history"):
+                switch_dialog()
+        return
+
+    with st.container(key="whochat", horizontal=True, horizontal_alignment="center"):
+        if st.button(who_line, type="tertiary", key="who-chat", help="Switch to another user's chat history"):
+            switch_dialog()
+        st.button("New chat", type="tertiary", key="new-chat", on_click=new_chat)
+    for i, turn in enumerate(state.turns):
+        with st.chat_message("user"):
+            st.html(f'<div class="you">{html.escape(turn["text"])}</div>')
+        with st.chat_message("assistant", avatar=":material/history:"):
+            fresh = state.get("animate") == i
+            if fresh:  # a short typing indicator, then the reply rises in
+                typing = st.empty()
+                typing.html('<div class="typing" aria-label="Recall is typing"><span></span><span></span>'
+                            '<span></span></div>')
+                time.sleep(0.6)
+                typing.empty()
+                state.animate = None
+            r = resolve(turn)
+            st.html(f'<div class="reply{" fresh" if fresh else ""}">{reply_html(r)}</div>')
+            with st.container(key=f"act-{i}", horizontal=True):
+                if st.button("Sources", key=f"src-{i}", type="tertiary"):
+                    sources_dialog(i)
+                if st.button("How I answered", key=f"how-{i}", type="tertiary"):
+                    how_dialog(i)
+                if live_ready and r.prediction is None and not r.no_evidence and st.button(
+                        "Get a live answer", key=f"live-{i}", type="tertiary"):
+                    with st.spinner("Reactor is answering, usually within a minute..."):
+                        answer = ask_reactor(turn["split"], turn["history"], turn["qid"] or "q_custom",
+                                             turn["question"], turn["date"], turn["version"], r.evidence, r.missing)
+                    state.setdefault("live", {})[r.live_key] = answer
+                    st.rerun()
+
+
+def sources_cited_share() -> tuple[int, int]:
+    """(answers that name their sources, answers), over every saved run."""
+    named = total = 0
+    for qid, rs in runs.items():
+        for r in rs:
+            prediction, _ = predict(qid, r["result"], r["logged"])
+            if not prediction["abstain"]:
+                total += 1
+                named += bool(prediction["citations"])
+    return named, total
+
+
+def about_page() -> None:
+    st.html(f'<div class="about-head"><div class="wordmark">{WORDMARK}</div>'
+            '<div class="line">A memory layer for AI assistants.</div></div>')
+    business, how, results = st.tabs(["For businesses", "How it works", "Results"])
+    with business:
+        named, total = sources_cited_share()
         st.html(f"""<div class="prose">
+<h2>A memory your customers can check.</h2>
+<p>Recall gives an AI assistant or a support team a reliable memory of months of past conversations: one answer, the
+conversations it came from, and an honest “I don't know” when the history doesn't say.</p>
+<h3>Who it's for</h3>
+<ul>
+<li><b>Support teams</b> picking up a customer they've talked to for months: what was promised, what changed, what
+was already tried.</li>
+<li><b>AI assistants with long-term memory</b> that must recall what a user said weeks ago without re-reading
+everything.</li>
+<li><b>Anyone who has to show their work</b>: every answer points back to the conversation it came from.</li>
+</ul>
+<div class="values">
+<div class="value"><div class="num">~200×</div><div class="what">Fewer characters per question</div>
+<div class="how">A median of 8.2k characters sent per question, against about 1.66 million in a full user history
+(the first 37 test questions).</div></div>
+<div class="value"><div class="num">~20×</div><div class="what">Less than loading a history once</div>
+<div class="how">All 9 or 10 of a user's questions together still send 19 to 23 times less than loading their whole
+history once (test histories).</div></div>
+<div class="value"><div class="num">{named} of {total}</div><div class="what">Answers with their sources</div>
+<div class="how">Every answer names the conversations it came from. Without Reactor's own labels, Recall cites only
+passages that contain the answer.</div></div>
+<div class="value"><div class="num">50%</div><div class="what">Of trap questions flagged</div>
+<div class="how">On unanswerable practice questions, v2 names the question's words that never appear, so Reactor
+can say “I don't know” instead of guessing. It flags 12.5% of answerable ones.</div></div>
+</div>
+<p class="muted" style="margin-top:18px">Measured on the challenge's practice and test sets. Final answers always
+come from Reactor.</p></div>""")
+    with how:
+        st.html("""<div class="prose">
 <h3>What Recall does</h3>
 <ol>
-<li><b>Reads the whole history once.</b> Every message, yours and the assistant's, is indexed so it can be
-searched in a fraction of a second.</li>
+<li><b>Reads the whole history once.</b> Every message, yours and the assistant's, is indexed so it can be searched
+in a fraction of a second.</li>
 <li><b>Works out what kind of question it is.</b> Questions that count, add up or put things in order get more
 conversations and more room than a simple lookup.</li>
 <li><b>Picks the few passages that matter.</b> From each matching conversation it keeps the best messages and the
@@ -596,19 +802,13 @@ you ask for the old one.</li>
 <li><b>Dates and order:</b> each passage says how many days before the question it was, worked out in code.</li>
 <li><b>Near-miss traps:</b> a question can be almost answerable. Recall names the words that appear nowhere in the
 passages, so Reactor says it doesn't know instead of guessing.</li>
-<li><b>Something the assistant said:</b> the assistant's messages are searched too, for "what did you recommend"
-questions.</li>
-<li><b>Questions with no answer:</b> "I don't know" is an answer, and it comes with no sources.</li>
-</ul>
-<p class="muted">On this history Recall read {short(sent_chars)} of {short(history_chars)} characters. Each answer
-costs less, comes back faster, and points to the conversation it came from.</p>
-</div>""")
-
-    with results_tab:
+<li><b>Something the assistant said:</b> the assistant's messages are searched too.</li>
+<li><b>Questions with no answer:</b> “I don't know” is an answer, and it comes with no sources.</li>
+</ul></div>""")
+    with results:
         dev_gold = load_gold("dev")
         out = []
-        files = sorted({r["file"] for rs in runs.values() for r in rs})
-        for name in files:
+        for name in sorted({r["file"] for rs in runs.values() for r in rs}):
             entries = [(q, r) for q, rs in runs.items() for r in rs if r["file"] == name and q in dev_gold]
             if not entries:
                 continue
@@ -618,8 +818,8 @@ costs less, comes back faster, and points to the conversation it came from.</p>
             out.append(table(rows, [("n", "Questions"), ("correct", "Match"), ("unjudged", "For the judge"),
                                     ("abstention_recall", "Rightly said “don't know”"),
                                     ("evidence_f1", "Sources right")]))
-            out.append('<div class="tcap">Scored with the organisers\' checker on one saved run. "For the judge": not '
-                       'an exact match, so the official judge decides.</div>')
+            out.append('<div class="tcap">Scored with the organisers\' checker on one saved run. "For the judge": '
+                       'not an exact match, so the official judge decides.</div>')
         test_runs = [r for q in load_questions("test") for r in runs.get(q["question_id"], [])]
         if test_runs:
             answered = sum(r["result"].get("status") == "answered" for r in test_runs)
@@ -638,25 +838,11 @@ costs less, comes back faster, and points to the conversation it came from.</p>
             out.append(table(rows, [("n", "Questions"), ("hit@5 v1", "Found, v1"), ("hit@5 v2", "Found, v2"),
                                     ("ans∈ev v1", "Answer sent, v1"), ("ans∈ev v2", "Answer sent, v2")]))
             out.append('<div class="tcap">Found: a right conversation is in the top 5. Answer sent: the expected '
-                       'answer is in the passages sent to Reactor. Measured offline (eval_retrieval.py).</div>')
+                       'answer is in the passages sent to Reactor. Measured offline.</div>')
         st.html("".join(out) or '<div class="sources-intro">No results saved yet.</div>')
 
-# ---------- sidebar: technical details ----------
 
-with details_slot:
-    st.markdown("#### Details")
-    rows = [("Question id", qid), ("History", f"{base['history_id']}, {n_sessions} conversations"),
-            ("Retrieval", f"v{version}, {len(evidence)} passages, {sent_chars:,} characters "
-                          f"(about {sent_chars / 4:,.0f} tokens; full history about {history_chars / 4:,.0f})")]
-    if result:
-        rows += [("Answer from", "a live Reactor call" if live_result else run["file"]),
-                 ("Status", result.get("status", "-")),
-                 ("Latency", f"{result['latency_s']:.0f} s" if result.get("latency_s") is not None else "-"),
-                 ("Citations from", cite_source)]
-        if g and prediction:
-            f1 = score_question(prediction, g)["evidence_f1"]
-            rows.append(("Evidence F1", "-" if f1 is None else f"{f1:.2f}"))
-    else:
-        rows.append(("Answer", f"none saved for v{version}"))
-    st.html('<dl class="adv">' + "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(str(v))}</dd>" for k, v in rows)
-            + "</dl>")
+with st.container(key="brand"):
+    st.html(f'<div class="wordmark">{WORDMARK}</div>')
+st.navigation([st.Page(chat_page, title="Chat", default=True),
+               st.Page(about_page, title="About", url_path="about")], position="top").run()

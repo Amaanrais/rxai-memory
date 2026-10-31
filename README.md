@@ -17,8 +17,8 @@ Headline results:
 |---|---|
 | Retrieval, dev (526 questions, ~50 sessions per history) | a gold session in the top 5 for **98.2%** of answerable questions |
 | Retrieval, dev-large (130 questions, ~500 sessions per history) | **93.5%** |
-| Characters sent per test question | median **8.2k** (whole message) vs **~1.66M** for the full history |
-| Test answers | placeholder: see [Results](#9-results) |
+| Characters sent per test question | median **11.3k** (whole message, v3) vs **~1.66M** for the full history |
+| Test run (v3, the submission) | **146 of 146** questions handled: **123 answers** citing their sources, **23 abstained (16%)** |
 
 ## 2. Architecture
 
@@ -41,7 +41,10 @@ flowchart LR
 | `listen.py` | after a timeout, listens on the Reactor history (sending nothing) for the late answer |
 | `tests/` | `python -m unittest discover tests` |
 | `eval_retrieval.py` | offline retrieval metrics on dev splits (no Reactor calls) |
-| `run_v2.py` | the v2 driver (section 7), not used for the test predictions |
+| `run_v3_test.py` | **the driver for the submitted predictions**: `run.py`'s driver with v3 evidence and question text |
+| `run_v2.py`, `run_v3.py` | the first v2 and v3 drivers (section 7); `run_v3_test.py` sends the same questions |
+| `compare.py` | two runs side by side against gold (dev) |
+| `efficiency.py` | characters sent per question and per history, against the full history (section 10) |
 | `app.py` | the Recall demo (section 11) |
 
 ## 3. Setup
@@ -65,24 +68,35 @@ printf 'Access key: '; read -rs REACTOR_ACCESS_KEY; echo; export REACTOR_ACCESS_
 
 ## 4. Reproducing predictions.jsonl
 
+The submitted `predictions.jsonl` is v3 (section 7), with `run_v3_test.py`'s defaults: no missing-words hint and
+the lenient abstain line.
+
 ```sh
-python run.py --questions test/questions.jsonl --histories test/histories.jsonl \
-    --base-url https://tNN.api.reactor-hackathon.rxai.dev --agent-id agt_... --out results-test.jsonl
-python make_predictions.py results-test.jsonl --questions test/questions.jsonl --out predictions.jsonl
+python run_v3_test.py --questions test/questions.jsonl --histories test/histories.jsonl \
+    --base-url https://tNN.api.reactor-hackathon.rxai.dev --agent-id agt_... --out results-test-v3.jsonl
+python make_predictions.py results-test-v3.jsonl --questions test/questions.jsonl --out predictions.jsonl
 ```
 
-`run.py` appends each answer to `results-test.jsonl` as it arrives and logs the evidence it sent to
-`results-test.evidence.jsonl`; `make_predictions.py` validates its output with `score.py`'s format check.
-On dev, `python score.py dev/gold.jsonl predictions.jsonl` scores it.
+`run_v3_test.py` appends each answer to `results-test-v3.jsonl` as it arrives (committed) and logs the evidence it
+sent to `results-test-v3.evidence.jsonl`; `make_predictions.py` validates its output with `score.py`'s format
+check. On dev, `python score.py dev/gold.jsonl predictions.jsonl` scores it.
 
-**Which code produced the test predictions.**
+The v3 run used the code at commit `5ada236`; `retrieval.py`, `run.py`, `run_v3_test.py` and `make_predictions.py`
+are unchanged since (tag `final-submission` adds only the app, the README and `efficiency.py`).
+`tests/test_run_v3_test.py` proves, with a recording stand-in for the client, that `run_v3_test.py` sends exactly
+what `run_v3.py --no-hint --lenient` sends (question text, date, `--max-chars` and evidence bytes): on the first 40
+dev questions as a unit test, and on all 526 (and `sample_hard`) with `python tests/test_run_v3_test.py <questions>
+<histories>`.
+
+**The v1 run**, kept for comparison: `results-test.jsonl` and `predictions-v1.jsonl`, from `run.py` and
+`make_predictions.py results-test.jsonl ...`.
 
 | Result lines | Driver | Notes |
 |---|---|---|
 | 1–32 | tag `v1-test-run` | client timeout 300 s (the kit's default) |
 | 33 onwards | tag `v1.1-test-run` | after a mid-run restart: driver changes only (section 5) |
 
-`predictions.jsonl` is built with `make_predictions.py` at `v1.1-test-run`. Between the two tags, **v1's evidence
+`predictions-v1.jsonl` is built with `make_predictions.py` at `v1.1-test-run`. Between the two tags, **v1's evidence
 and question text are byte-identical**: we ran both drivers on all 526 dev questions with a recording stand-in for
 the client and compared the question text, date, `--max-chars` and evidence bytes of every question (0
 differences), and the evidence logs (identical, 9,050,462 bytes). Only the driver's behaviour changed.
@@ -102,6 +116,11 @@ Following the organisers' guidance on Discord:
   question's `late_replies` (matched by its ref), it is recorded as that question's answer, marked `recovered`.
   `make_predictions.py` keeps exactly one line per question: the original question's late answer over a retry's,
   otherwise the earlier of two answered lines (`tests/test_make_predictions.py`).
+- **Wait for the agent after a new history** (`run.py` and `run_v3_test.py` since `5ada236`). A new history
+  restarts the agent, and a question sent before it is back up fails at once (chat closed, HTTP 403 or
+  `history_resetting`). So the driver waits 15 s (`--settle`) after `--new-history`, and a question that fails
+  that way before anything is answered in its Reactor history is asked again in the same history after 10, 20
+  and 40 s. Every attempt is still recorded. In the v3 test run no question needed it.
 - **Resume without a reset.** After a restart, the dataset history in progress continues in its Reactor history
   (the agent's current one), before any other history is started.
 
@@ -110,6 +129,13 @@ answer for them ever arrived. Their Reactor history had already been replaced wh
 asked again in a fresh Reactor history for their dataset history, the kit's documented rerun behaviour
 (`reactor/QUICKSTART.md`, "A rerun starts a new Reactor history"). Every question carries its own evidence, so
 nothing from the earlier history is needed.
+
+In the v3 run, one dataset history (`h_8224cd1fdcd0`, 10 questions) was split across two Reactor histories. Its
+fifth question, `q_3664132a79f0`, timed out after 600 s; no late answer arrived while the driver listened, and when
+it was asked again in the same Reactor history the server refused with `history_changed`, so the driver started a
+new Reactor history for that dataset history and asked it and the remaining five questions there. All 10 were
+answered (the first four in the first Reactor history). The other 14 dataset histories each used one Reactor
+history, and the run had no other timeout, error or refusal: 147 result lines for 146 questions.
 
 ## 6. Design decisions
 
@@ -132,10 +158,9 @@ nothing from the earlier history is needed.
      them, so it cites nothing);
   4. abstentions cite nothing. We never fall back to the top-ranked session.
 
-## 7. v2: built and measured, not used for the test predictions
+## 7. v2 and v3 (the submitted version)
 
-v2 (`retrieval.py` `version=2`, `run_v2.py`) was built and measured on dev, but there wasn't the Reactor time to
-run it on test. It adds:
+v2 (`retrieval.py` `version=2`, `run_v2.py`) adds to v1:
 
 - **Focused trimming**: a long turn keeps the stretch with the most question words, not its beginning.
 - **Lead-session budget**: a clearly leading session gets up to half the budget.
@@ -158,6 +183,24 @@ was left out.
 The missing-words hint fires on **15 of 30 (50%)** unanswerable dev questions, against **62 of 496 (12.5%)**
 answerable ones; on dev-large, 3 of 6 against 2 of 124 (1.6%).
 
+**v3** (`version=3`) is v2 plus, for questions asking for a name ("what is my dog's name", "who is my
+instructor"):
+
+- **Synonyms** for the entity word, at weight 0.6 (dog → puppy, pup, pet; partner → husband, wife, boyfriend,
+  girlfriend; instructor → teacher, coach; …).
+- **A name boost** (×1.5) for turns with a capitalised, name-like word within 40 characters of the entity word.
+- **Routing to 8 sessions** in 24,000 characters.
+
+Other questions get exactly v2's evidence. On the 12 answerable name questions in dev-large, ans∈ev rises from
+0.833 to 0.917 (hit@5 unchanged at 0.917); on dev's 12, nothing changes (hit@5 1.0).
+
+v1's test run abstained on 31 of 146 questions (21%), all of them Reactor answering INSUFFICIENT_EVIDENCE; 48
+test questions ask for a name and 13 of those were abstentions. So the submission runs v3 with two prompt
+settings, `run_v3_test.py`'s defaults: **no missing-words hint**, and a **lenient abstain line**: "Answer
+INSUFFICIENT_EVIDENCE only if nothing in the evidence addresses the question. If the evidence gives a likely
+answer, give it." The other instructions stay as in v2: the `[E#]` labels on the answer line, one value (or work
+it out, for counting and ordering questions), and the most recent value for a value that may have changed.
+
 ## 8. Compliance
 
 - Final answers come only from Reactor, through the organisers' `reactor/client.py`; we don't edit them.
@@ -166,7 +209,7 @@ answerable ones; on dev-large, 3 of 6 against 2 of 124 (1.6%).
 
 ## 9. Results
 
-**Retrieval** (offline, `eval_retrieval.py`; v1, the version used on test):
+**Retrieval** (offline, `eval_retrieval.py`; v1, the base that v2 and v3 build on):
 
 | dev, by type | n | hit@5 | sent | ans∈ev |
 |---|---|---|---|---|
@@ -195,17 +238,43 @@ diagnosed its failures by hand (an answer cut off by the excerpt budget, a near-
 abstaining, a two-session difference, an event order needing a date from elsewhere in a session), and they
 motivated v2.
 
-**Test**: _placeholder, to be filled in from the official scores._
+**Test** (no gold; v3 is the submission):
+
+| | v1 (`predictions-v1.jsonl`) | v3 (`predictions.jsonl`) |
+|---|---|---|
+| questions handled | 146 of 146 | 146 of 146 |
+| answers, each citing its sources | 115 | **123** |
+| abstained | 31 (21%) | **23 (16%)** |
+| citations from | | Reactor's own labels on the answer line, for all 123 |
+| Reactor histories | | 16 for 15 dataset histories (one split, section 5) |
+
+The test split has gold-unanswerable questions too, so some abstention is correct; official scores will say how
+many of the 23 are.
 
 ## 10. Efficiency
 
-- **Per question.** The whole message we send (question, instructions, excerpts, the client's template) has a
-  median of **8.2k characters** (max 14.1k) over the first 37 test questions, against **~1.66M characters** for
-  a full test history: roughly 200× less per question.
-- **Per dataset history**, against the organisers' baseline of loading the whole history once: a test history
-  has 9–10 questions, so we send ~10 × 8.5k ≈ 85k characters against ~1.66M, **19–23× less** as measured. Even if
-  every question used its full budget, the ratio would stay above **~6.5×** (all routed, 24k) to **~12×** (none
-  routed). Loading also takes 65–125 messages per history (at 32k or 16k characters each), each a full agent turn.
+Measured on all 146 test questions from each run's evidence log (`efficiency.py`: the whole message, i.e.
+question, instructions, excerpts and the client's template, built with `reactor/client.py`'s own
+`build_message`), against a full test history of **1.66M characters** (median; 1.63M to 1.73M):
+
+| | v1 | v3 (submitted) |
+|---|---|---|
+| message per question, median | 8.6k characters | 11.3k characters |
+| message per question, max | 20.7k | 21.0k |
+| per question, less than the full history (median) | 190× | **147×** |
+| per dataset history, all its questions together (median) | 85k | 114k |
+| per dataset history, less than loading it once (median) | 20× | **15×** |
+| per dataset history, range | 12–26× | 11–25× |
+
+v3 sends more because the 48 name questions get 8 sessions: their median evidence goes from 5.7k to 11.2k characters,
+while the other 98 questions stay at about 8.7k. Per dataset history,
+each question is counted once (a retry sends the same message again). Loading a history also takes 65–125
+messages (at 32k or 16k characters each), each a full agent turn.
+
+```sh
+python efficiency.py results-test.evidence.jsonl results-test-v3.evidence.jsonl \
+    --questions test/questions.jsonl --histories test/histories.jsonl
+```
 
 ## 11. Demo app: Recall
 
@@ -233,4 +302,6 @@ history, which ends the benchmark's.
   code; that would make ordering questions deterministic.
 - **A local reranker** (cross-encoder or embeddings) on the BM25 candidates, for questions worded differently
   from the conversation (siblings vs brother, hikes vs trail), where dev-large retrieval drops most.
-- **Running v2 on test**, once there is Reactor time.
+- **Abstention vs. traps.** The lenient line lowers abstentions (21% → 16%); without gold for test we can't yet
+  say how many near-miss traps it lets through. The missing-words hint (off in the submission) is the guard to
+  bring back if it lets through too many.

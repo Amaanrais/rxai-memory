@@ -12,3 +12,4 @@ __pycache__/
 presentation/video/build/
 presentation/video/*.mp4
 *.partial
+.DS_Store

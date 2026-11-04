@@ -47,7 +47,7 @@ SET_NAMES = {"dev": "practice set", "test": "test set"}
 # the suggestions on the start screen: the user's own words, the dev question they stand for, whether it runs on v2
 CHIPS = [("What did I bake for my niece's party?", "q_4feb114c6944", False),
          ("Where's the Ethereal Dreams painting now?", "q_415adf25cebc", False),
-         ("Where did I present my undergrad poster?", "q_43824099a143", True),  # the trap: v2 names missing words
+         ("What's my hamster's name?", "q_1773242b1801", False),  # no answer in the history: saved runs abstain
          ("What 2FA methods did you mention?", "q_14252c64d73d", False)]
 # a first name for each demo user (the histories are anonymous); other users get one from NAMES by their id
 PEOPLE = {"h_e6d0b8417122": "Alex", "h_805dae031df3": "Sam", "h_c2c3efa33e8e": "Priya", "h_2bbadf4a2bcd": "Jordan"}
@@ -60,7 +60,7 @@ MARK_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle
             '<rect x="14.5" y="19.6" width="7" height="1.6" rx="0.8" fill="#9fb9ba"/></svg>')
 # the browser tab's icon
 MARK_URL = "data:image/svg+xml;base64," + __import__("base64").b64encode(MARK_SVG.encode()).decode()
-# the wordmark: "Recall" in ink with a teal full stop
+# the wordmark: "Recall" in the theme's teal with a lighter teal full stop
 WORDMARK = 'Recall<span class="dot">.</span>'
 
 st.set_page_config(page_title="Recall", page_icon=MARK_URL, layout="centered",
@@ -454,9 +454,9 @@ split = st.sidebar.radio("Dataset", list(SPLITS), horizontal=True,
                          help="dev is the practice set, with expected answers; test is the scored set")
 version = int(st.sidebar.radio("Retrieval version", ["v1", "v2", "v3"], index=2, horizontal=True,
                                 help="v3 produced the submitted answers: v2 plus name search and a wider budget "
-                                     "for name questions. v2 adds focused trimming, more room for a leading "
-                                     "conversation, time sentences and the missing-words note. v1 was the first "
-                                     "test run. The trap suggestion always uses v2.")[1])
+                                     "for name questions, with the missing-words hint off. v2 adds focused "
+                                     "trimming, more room for a leading conversation, time sentences and the "
+                                     "missing-words hint. v1 was the first test run.")[1])
 live_ready = LIVE and all(os.environ.get(k) for k in LIVE_ENV)
 st.sidebar.markdown("#### Live answers")
 if live_ready:
@@ -510,10 +510,10 @@ def resolve(turn: dict) -> SimpleNamespace:
     live_result = state.get("live", {}).get(live_key)
     if run and run["logged"]:
         evidence = run["logged"]["evidence"]
-        missing = run["logged"].get("missing") or (index.missing_words(turn["question"], evidence) if v >= 2 else [])
+        missing = (run["logged"].get("missing") or index.missing_words(turn["question"], evidence)) if v == 2 else []
     else:
         evidence = index.evidence(turn["question"], question_date=turn["date"], version=v)
-        missing = index.missing_words(turn["question"], evidence) if v >= 2 else []
+        missing = index.missing_words(turn["question"], evidence) if v == 2 else []  # v3 sends no hint
     result = live_result or (run["result"] if run else None)
     prediction, cite_source = predict(qid or "q_custom", result, {"evidence": evidence}) if result else (None, "")
     evidence_chars = sum(len(e["text"]) for e in evidence)
@@ -615,9 +615,9 @@ def how_html(turn: dict, r: SimpleNamespace) -> str:
     if turn["qid"] and turn["text"].strip() != turn["question"].strip():
         out.append(f"<h4>The question</h4><div>You asked “{html.escape(turn['text'])}”. I looked it up as "
                    f"“{html.escape(turn['question'])}”, asked on {day(turn['date'])}.</div>")
-    out.append("<h4>Checking the sources</h4>")
+    out.append("<h4>Where the sources come from</h4>")
     if r.prediction is None:
-        out.append('<div class="muted">Nothing to check yet: this question hasn\'t been sent to Reactor.</div>')
+        out.append('<div class="muted">No sources yet: this question hasn\'t been sent to Reactor.</div>')
     else:
         out.append(f"<div>{CITE_WORDS.get(r.cite_source, html.escape(r.cite_source))}</div>")
     if r.missing:
@@ -767,18 +767,18 @@ everything.</li>
 <li><b>Anyone who has to show their work</b>: every answer points back to the conversation it came from.</li>
 </ul>
 <div class="values">
-<div class="value"><div class="num">~200×</div><div class="what">Fewer characters per question</div>
-<div class="how">A median of 8.2k characters sent per question, against about 1.66 million in a full user history
-(the first 37 test questions).</div></div>
-<div class="value"><div class="num">~20×</div><div class="what">Less than loading a history once</div>
-<div class="how">All 9 or 10 of a user's questions together still send 19 to 23 times less than loading their whole
-history once (test histories).</div></div>
+<div class="value"><div class="num">~147×</div><div class="what">Fewer characters per question</div>
+<div class="how">A median of 11.3k characters sent to Reactor per question, against about 1.66 million in a full
+user history (all 146 test questions, the submitted run).</div></div>
+<div class="value"><div class="num">~15×</div><div class="what">Less than loading a history once</div>
+<div class="how">All of a user's questions together still send about 15 times less than loading their whole history
+once (11 to 25 times across the test histories).</div></div>
 <div class="value"><div class="num">{named} of {total}</div><div class="what">Answers with their sources</div>
-<div class="how">Every answer names the conversations it came from. Without Reactor's own labels, Recall cites only
-passages that contain the answer.</div></div>
-<div class="value"><div class="num">50%</div><div class="what">Of trap questions flagged</div>
-<div class="how">On unanswerable practice questions, v2 names the question's words that never appear, so Reactor
-can say “I don't know” instead of guessing. It flags 12.5% of answerable ones.</div></div>
+<div class="how">Reactor names the passages it used, and Recall maps those labels to the conversations they came
+from.</div></div>
+<div class="value"><div class="num">16%</div><div class="what">“I don't know” on test</div>
+<div class="how">23 of 146 test questions in the submitted run, down from 31 (21%) in our first run. The
+missing-words hint was off in the submitted run.</div></div>
 </div>
 <p class="muted" style="margin-top:18px">Measured on the challenge's practice and test sets. Final answers always
 come from Reactor.</p></div>""")
@@ -794,7 +794,8 @@ conversations and more room than a simple lookup.</li>
 ones either side, with the date and how long before the question it was.</li>
 <li><b>Reactor answers from those passages.</b> It must point to the passages it used, give one value, and use the
 most recent one when something changed.</li>
-<li><b>Recall checks the sources, or says it doesn't know.</b> It cites only conversations that support the answer.
+<li><b>Recall shows the sources, or says it doesn't know.</b> The passages Reactor names are mapped to the
+conversations they came from.
 If Reactor finds nothing that answers the question, Recall says so, with no sources.</li>
 </ol>
 <h3>The hard cases it handles</h3>
@@ -802,8 +803,9 @@ If Reactor finds nothing that answers the question, Recall says so, with no sour
 <li><b>Facts that changed:</b> passages are in date order and the latest is marked, so the newest value wins unless
 you ask for the old one.</li>
 <li><b>Dates and order:</b> each passage says how many days before the question it was, worked out in code.</li>
-<li><b>Near-miss traps:</b> a question can be almost answerable. Recall names the words that appear nowhere in the
-passages, so Reactor says it doesn't know instead of guessing.</li>
+<li><b>Near-miss traps:</b> a question can be almost answerable. Retrieval v2 can name the words that appear
+nowhere in the passages, so Reactor says it doesn't know instead of guessing. This hint was off in the submitted run,
+because it also fired on 12.5% of answerable practice questions.</li>
 <li><b>Something the assistant said:</b> the assistant's messages are searched too.</li>
 <li><b>Questions with no answer:</b> “I don't know” is an answer, and it comes with no sources.</li>
 </ul></div>""")
@@ -822,23 +824,25 @@ passages, so Reactor says it doesn't know instead of guessing.</li>
                                     ("evidence_f1", "Sources right")]))
             out.append('<div class="tcap">Scored with the organisers\' checker on one saved run. "For the judge": '
                        'not an exact match, so the official judge decides.</div>')
-        test_runs = [r for q in load_questions("test") for r in runs.get(q["question_id"], [])]
-        if test_runs:
-            answered = sum(r["result"].get("status") == "answered" for r in test_runs)
-            out.append(f'<div class="prose"><h3>Test run</h3><p>{answered} of {len(load_questions("test"))} test '
-                       f'questions answered so far. Expected answers for test aren\'t released.</p></div>')
+        submitted = [predict(q["question_id"], r["result"], r["logged"])[0] for q in load_questions("test")
+                     for r in runs.get(q["question_id"], []) if r["file"] == "results-test-v3.jsonl"]
+        if submitted:
+            abstained = sum(p["abstain"] for p in submitted)
+            out.append(f'<div class="prose"><h3>Test run</h3><p>The submitted run (v3) sent all {len(submitted)} '
+                       f'test questions to Reactor: {len(submitted) - abstained} answers, {abstained} “I don\'t '
+                       f'know”. Expected answers for test aren\'t released, so there is no test accuracy.</p></div>')
         for split_name, title in (("dev", "Finding the right conversations, 526 practice questions"),
                                   ("dev-large-130", "The same, with 10 times longer histories (130 questions)")):
-            paths = {v: ROOT / "metrics" / f"retrieval-{split_name}-v{v}.json" for v in (1, 2)}
+            paths = {v: ROOT / "metrics" / f"retrieval-{split_name}-v{v}.json" for v in (1, 2, 3)}
             if not all(p.exists() for p in paths.values()):
                 continue
             data = {v: json.loads(p.read_text(encoding="utf-8"))["rows"] for v, p in paths.items()}
             rows = {TYPE_NAMES.get(k, k): {"n": data[1][k]["n"], **{f"{m} v{v}": data[v][k].get(m)
-                                                                    for m in ("hit@5", "ans∈ev") for v in (1, 2)}}
+                                                                    for m in ("hit@5", "ans∈ev") for v in (1, 2, 3)}}
                     for k in data[1]}
             out.append(f'<div class="prose"><h3>{title}</h3></div>')
-            out.append(table(rows, [("n", "Questions"), ("hit@5 v1", "Found, v1"), ("hit@5 v2", "Found, v2"),
-                                    ("ans∈ev v1", "Answer sent, v1"), ("ans∈ev v2", "Answer sent, v2")]))
+            out.append(table(rows, [("n", "Questions")] + [(f"hit@5 v{v}", f"Found, v{v}") for v in (1, 2, 3)]
+                             + [(f"ans∈ev v{v}", f"Answer sent, v{v}") for v in (1, 2, 3)]))
             out.append('<div class="tcap">Found: a right conversation is in the top 5. Answer sent: the expected '
                        'answer is in the passages sent to Reactor. Measured offline.</div>')
         st.html("".join(out) or '<div class="sources-intro">No results saved yet.</div>')
